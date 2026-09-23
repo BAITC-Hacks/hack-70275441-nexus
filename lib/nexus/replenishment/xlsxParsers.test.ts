@@ -1,0 +1,87 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import * as XLSX from "xlsx";
+import {
+  parseInboundShipments,
+  parseMonthlyOpeningStock,
+  parseMonthlySales,
+  parseSalesTransactions,
+} from "./xlsxParsers.ts";
+
+function workbookBytes(rows: unknown[][], sheetName = "Лист_1"): Uint8Array {
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet(rows), sheetName);
+  return XLSX.write(workbook, { type: "buffer", bookType: "xlsx" });
+}
+
+test("transaction parser converts signed source quantities to positive unitsSold", () => {
+  const bytes = workbookBytes([
+    ["Дата", "Номер", "Документ", "Код", "Номенклатура", "Ед.", "Склад", "Количество"],
+    ["05.09.2026 14:30:00", "INV-1", "Продажа INV-1", "SKU-1", "Автомат", "шт", "Основной", -12],
+    [new Date("2026-09-06T10:00:00Z"), "INV-2", "Продажа INV-2", "SKU-2", "Кабель", "м", "Основной", -3],
+  ]);
+
+  const parsed = parseSalesTransactions(bytes);
+  assert.equal(parsed.length, 2);
+  assert.equal(parsed[0].unitsSold, 12);
+  assert.equal(parsed[0].sourceQuantity, -12);
+  assert.equal(parsed[0].sku, "SKU-1");
+  assert.match(parsed[0].occurredAt, /^2026-09-05T14:30:00/);
+});
+
+test("monthly sales parser understands two-level headers and normalizes blank/NaN cells to zero", () => {
+  const bytes = workbookBytes([
+    ["Номенклатура", "Ед.", "Номенклатурн.код", "янв. 2026", "фев. 2026", "Итого"],
+    [null, null, null, "Количество", "Количество", "Количество"],
+    ["Автомат", "шт", "SKU-1", 10, null, 10],
+    ["Кабель", "м", "SKU-2", Number.NaN, 7, 7],
+  ]);
+
+  const parsed = parseMonthlySales(bytes);
+  assert.deepEqual(parsed.filter((row) => row.sku === "SKU-1").map((row) => [row.month, row.unitsSold]), [["2026-01", 10], ["2026-02", 0]]);
+  assert.deepEqual(parsed.filter((row) => row.sku === "SKU-2").map((row) => [row.month, row.unitsSold]), [["2026-01", 0], ["2026-02", 7]]);
+});
+
+test("opening-stock parser skips qualifier rows and emits one record per available month column", () => {
+  const bytes = workbookBytes([
+    ["Номенклатура", "Ед.", "Номенклатурн.код", "авг. 2026", "сент. 2026"],
+    [null, null, null, "Количество", "Количество"],
+    [null, null, null, "нач. остаток", "нач. остаток"],
+    ["Автомат", "шт", "SKU-1", 21, null],
+    ["Кабель", "м", "SKU-2", 100, 80],
+  ]);
+
+  assert.deepEqual(parseMonthlyOpeningStock(bytes).filter((row) => row.sku === "SKU-1"), [
+    { sku: "SKU-1", productName: "Автомат", unit: "шт", month: "2026-08", openingStock: 21 },
+    { sku: "SKU-1", productName: "Автомат", unit: "шт", month: "2026-09", openingStock: 0 },
+  ]);
+});
+
+test("IEK inbound parser expands dated shipment columns", () => {
+  const bytes = workbookBytes([
+    ["Код 1с", "Артикул ИЭК", "Наименование", "УТ-8231 (поступление до 30.09.2026)", "УТ-8234 (поступление до 15.10.2026)"],
+    ["SKU-1", "ART-1", "Автомат", 20, 30],
+    ["SKU-2", "ART-2", "Кабель", null, 5],
+  ]);
+
+  const parsed = parseInboundShipments(bytes);
+  assert.equal(parsed.length, 3);
+  assert.deepEqual(parsed[0], {
+    sku: "SKU-1", supplierArticle: "ART-1", productName: "Автомат",
+    shipmentId: "УТ-8231 (поступление до 30.09.2026)", expectedDate: "2026-09-30", quantity: 20,
+  });
+});
+
+test("Systeme Electric inbound parser selects only the aggregate in-transit column from a dashboard", () => {
+  const bytes = workbookBytes([
+    [null, null, null, null, "СКЛАДЫ"],
+    ["№", "Артикул поставщика", "Код 1с", "Наименование", "Кэф. Роста", "Кэф. Сез-ти", "Остаток", "СЭ в пути 24.09"],
+    [1, "ART-1", "SKU-1", "Автомат", 1.4, 0.8, 11, 40],
+    [2, "ART-2", "SKU-2", "Кабель", 9.9, 9.9, 20, 0],
+  ]);
+
+  assert.deepEqual(parseInboundShipments(bytes), [{
+    sku: "SKU-1", supplierArticle: "ART-1", productName: "Автомат",
+    shipmentId: "СЭ в пути 24.09", expectedDate: null, quantity: 40,
+  }]);
+});
