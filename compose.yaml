@@ -1,0 +1,23 @@
+services:
+  nexus:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: nexus-electrokomplekt:local
+    init: true
+    restart: unless-stopped
+    ports:
+      - "${NEXUS_PORT:-3000}:3000"
+    environment:
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      OPENAI_MODEL: "${OPENAI_MODEL:-gpt-5-mini}"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "require('node:http').get('http://127.0.0.1:3000/api/health',r=>{if(r.statusCode!==200)process.exit(1);r.resume()}).on('error',()=>process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      start_period: 10s
+      retries: 3

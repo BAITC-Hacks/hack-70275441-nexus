@@ -1,0 +1,18 @@
+.git
+.github
+.next
+.vercel
+node_modules
+npm-debug.log*
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+.claude
+.agents
+.codex
+coverage
+out
+IEK
+Systeme electric
+demo/data/replenishment

@@ -149,6 +149,35 @@ npm run lint      # eslint .
 npm run build     # next build
 ```
 
+## Docker
+
+Приложение запускается одним контейнером: Next.js одновременно раздаёт frontend и обслуживает API routes. База данных и дополнительные сервисы не требуются.
+
+1. При необходимости скопируйте `.env.example` в `.env` и задайте `OPENAI_API_KEY`. Ключ опционален: без него расчёт и детерминированные объяснения продолжают работать.
+2. Соберите и запустите приложение:
+
+```bash
+docker compose up --build
+```
+
+Интерфейс будет доступен на `http://localhost:3000`, healthcheck — на `http://localhost:3000/api/health`. Для другого порта задайте `NEXUS_PORT`, например `NEXUS_PORT=8080 docker compose up --build`.
+
+Переменные окружения:
+
+```text
+OPENAI_API_KEY=  # опционально, только для LLM-обоснования
+OPENAI_MODEL=    # опционально, по умолчанию gpt-5-mini
+NEXUS_PORT=      # опционально, внешний порт Docker Compose; по умолчанию 3000
+```
+
+Остановка:
+
+```bash
+docker compose down
+```
+
+Секреты не копируются в image и передаются контейнеру только во время запуска.
+
 ### Структура репозитория
 
 ```text
