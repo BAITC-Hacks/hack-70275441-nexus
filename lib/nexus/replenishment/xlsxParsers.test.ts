@@ -5,6 +5,7 @@ import {
   parseInboundShipments,
   parseMonthlyOpeningStock,
   parseMonthlySales,
+  parseMinimumOrderQuantities,
   parseSalesTransactions,
 } from "./xlsxParsers.ts";
 
@@ -84,4 +85,18 @@ test("Systeme Electric inbound parser selects only the aggregate in-transit colu
     sku: "SKU-1", supplierArticle: "ART-1", productName: "Автомат",
     shipmentId: "СЭ в пути 24.09", expectedDate: null, quantity: 40,
   }]);
+});
+
+test("MOQ parser normalizes both partner header variants", () => {
+  const iek = workbookBytes([
+    ["№", "Код 1с", "Артикул поставщика", "Наименование", "Мин. разр. к отгр."],
+    [1, "SKU-1", "ART-1", "Автомат", 12],
+  ]);
+  const systeme = workbookBytes([
+    ["№", "Номенклатура", "Номенклатура.Код", "Артикул", "Кратность"],
+    [null, null, null, null, null],
+    [1, "Кабель", "SKU-2", "ART-2", 5],
+  ]);
+  assert.deepEqual(parseMinimumOrderQuantities(iek), [{ sku: "SKU-1", supplierArticle: "ART-1", productName: "Автомат", multiple: 12 }]);
+  assert.deepEqual(parseMinimumOrderQuantities(systeme), [{ sku: "SKU-2", supplierArticle: "ART-2", productName: "Кабель", multiple: 5 }]);
 });

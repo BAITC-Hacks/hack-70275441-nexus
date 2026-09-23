@@ -1,6 +1,7 @@
 import * as XLSX from "xlsx";
 import type {
   InboundShipment,
+  MinimumOrderQuantity,
   MonthlyOpeningStock,
   MonthlySales,
   SalesTransaction,
@@ -215,5 +216,27 @@ export function parseInboundShipments(input: XlsxInput, sheetName?: string): Inb
         quantity,
       }];
     });
+  });
+}
+
+export function parseMinimumOrderQuantities(input: XlsxInput, sheetName?: string): MinimumOrderQuantity[] {
+  const rows = rowsFromWorkbook(input, sheetName);
+  const headerIndex = findHeaderRow(rows, [/код/, /кратность|мин разр к отгр/]);
+  const header = rows[headerIndex];
+  const sku = requireColumn(header, [/^код 1с$/, /^номенклатура код$/, /номенклатурн.*код/], "SKU code");
+  const product = requireColumn(header, [/^номенклатура$/, /^наименование$/], "product name");
+  const supplierArticle = findColumn(header, [/^артикул(?: поставщика)?$/]);
+  const multiple = requireColumn(header, [/^кратность$/, /^мин разр к отгр$/], "MOQ/order multiple");
+
+  return rows.slice(headerIndex + 1).flatMap((row) => {
+    const skuValue = text(row[sku]);
+    const multipleValue = numberValue(row[multiple]);
+    if (!skuValue || multipleValue === null || multipleValue <= 0) return [];
+    return [{
+      sku: skuValue,
+      ...(supplierArticle >= 0 && text(row[supplierArticle]) ? { supplierArticle: text(row[supplierArticle]) } : {}),
+      productName: text(row[product]),
+      multiple: multipleValue,
+    }];
   });
 }

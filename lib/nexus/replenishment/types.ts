@@ -41,4 +41,12 @@ export interface InboundShipment {
   quantity: number;
 }
 
+export interface MinimumOrderQuantity {
+  sku: string;
+  supplierArticle?: string;
+  productName: string;
+  /** Smallest permitted order multiple. */
+  multiple: number;
+}
+
 export type XlsxInput = ArrayBuffer | Uint8Array;
