@@ -55,11 +55,16 @@ A red KPI tile does not investigate itself. Someone still has to pull the data, 
 
 ## 2. Who has this problem
 
-Anyone who owns a recurring risk metric and gets only the metric, not the investigation behind it:
+Anyone who owns a recurring risk metric and gets only the metric, not the investigation behind it — the
+original design targets (construction schedule risk, credit portfolio risk, government service backlogs)
+predate the verticals removed from this repository (see §12/§14) and no longer have a working tool pack
+here.
 
-- a **construction PM** watching schedule slip against procurement and FX exposure;
-- a **credit risk / portfolio analyst** watching a default rate against funding cost and delinquency;
-- a **government service manager** watching request backlogs and repeat-complaint rates across departments.
+**This hackathon's actual user** is a **purchasing manager** (менеджер отдела закупа) at ТОО
+«Электрокомплект», who today computes warehouse replenishment by hand in Excel — see the Status/Disclosure
+section at the top of this file for the real case being solved.
+
+## 3. Why monitoring alone is insufficient
 
 ## 3. Why monitoring alone is insufficient
 
@@ -152,7 +157,7 @@ One consequence of the split worth recording rather than rediscovering: TIME_SER
 
 `lib/nexus/domains/` holds one file per domain: canonical metric definitions (id, Russian label, unit, risk direction, aliases), detection thresholds, and (optionally) causal priors and a scenario config.
 
-Registered today: `RETAIL`, `LOGISTICS`, `MANUFACTURING`, `MINING` — vocabulary/detection metadata only, no deterministic tool pack, no scenario; they demonstrate registry breadth, not prepared demo verticals.
+Registered today: `RETAIL`, `LOGISTICS`, `MANUFACTURING`, `MINING` — vocabulary/detection metadata only, no deterministic tool pack, no scenario; they demonstrate registry breadth, not prepared demo verticals. `LOGISTICS` is the domain relevant to this hackathon's actual case (see Status/Disclosure at the top) — but the case's reorder calculation is a **new, separate deterministic module** (`lib/nexus/replenishment/`), not a Registry-driven investigation tool pack; the case's shape (compute a recommended order quantity) doesn't fit the Investigator/Skeptic-style investigation this Registry mechanism was built to serve.
 
 Runtime capability resolution (`resolveRuntimeToolPackScenario`) is a pure function: an explicit task wins outright; otherwise an ordinary upload's resolved domain may link to a registered task's tool pack; an unregistered or tool-pack-less domain always falls back to the generic engine. No domain name ever appears as a branch inside the generic agents or the API route.
 
@@ -163,9 +168,13 @@ Runtime capability resolution (`resolveRuntimeToolPackScenario`) is a pure funct
 - **What it supports**: descriptive investigation, hypothesis formation and challenge, a validated evidence package, and a controlled export for a human decision.
 - **What it does not automate**: it does not decide policy, does not execute a financial/operational action, and does not claim proven causality. Every export exists to be reviewed by a person, not to trigger anything automatically.
 
+**This hackathon's concrete application** is narrower and not risk-investigation-shaped at all: a
+purchasing manager gets a recommended supplier-order quantity per SKU, with an explainable justification,
+instead of a manual Excel calculation — see Status/Disclosure at the top.
+
 ## 14. Development potential
 
-The current build intentionally proves breadth (Domain Registry, generic runtime) without building out any specific vertical, so the next domain is added to fit an actual task rather than retrofitted around a pre-built demo:
+The current build intentionally proves breadth (Domain Registry, generic runtime) without building out any specific vertical, so the next domain is added to fit an actual task rather than retrofitted around a pre-built demo. **This is happening live right now for `LOGISTICS`** — not hypothetically — see Status/Disclosure at the top for the actual case and progress checklist.
 
 - **A scenario/intervention panel or specialized tool pack for a registered domain** — `RETAIL`/`LOGISTICS`/`MANUFACTURING`/`MINING` already have canonical metric vocabularies; `lib/nexus/templates/domainToolPack.template.ts` is a ready starting shape for a new tool pack.
 - **Specialized deterministic tool packs** for a new domain, only where the generic six tools genuinely cannot express the needed calculation.
@@ -248,12 +257,22 @@ docs/                      Methodology and hackathon-adaptation documentation
 
 ## 21. Hackathon adaptation model
 
-This repository is a **reference implementation** — the actual submission adapts this infrastructure to whatever technical specification is announced on-site, following:
+This repository was designed as a **reference implementation** meant to adapt to whatever technical
+specification is announced on-site. **That adaptation is what's actually happening in this repository right
+now**, for the real announced case (HackAlem AI, Логистика — «Электрокомплект», automatic supplier-order
+replenishment; see Status/Disclosure at the top), not a hypothetical future one:
 
 ```text
 Read the spec → decide if NEXUS fits → inspect the dataset → choose/adapt a Domain Pack
 → resolve runtime capability → map schema → define the objective → run the pipeline
 → add domain computation only if required → define a safe action → verify → rewrite presentation
 ```
+
+For this specific case, the "spec fits NEXUS" answer was **partial**: the task is a deterministic
+replenishment calculation, not an investigation, so the Investigator/Skeptic pipeline above doesn't apply
+directly — what carries over is the ingestion layer, the outlier-detection primitive (repurposed to exclude
+one-off large orders from regular demand), the Evidence/never-fabricate discipline, and the
+narration/reporting pattern, wrapped around a new deterministic calculation module built for this case
+(`lib/nexus/replenishment/`).
 
 The full step-by-step procedure, a real file map with safe/unsafe change boundaries, a coding-agent prompt template, and a review checklist live in [docs/task-adaptation-harness.md](docs/task-adaptation-harness.md). A narrower, TIME_SERIES-specific quick reference is at [docs/task-adaptation-quickref.md](docs/task-adaptation-quickref.md).
