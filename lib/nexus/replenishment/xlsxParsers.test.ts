@@ -7,6 +7,7 @@ import {
   parseMonthlySales,
   parseMinimumOrderQuantities,
   parseSalesTransactions,
+  parseSkuReservations,
 } from "./xlsxParsers.ts";
 
 function workbookBytes(rows: unknown[][], sheetName = "Лист_1"): Uint8Array {
@@ -99,4 +100,17 @@ test("MOQ parser normalizes both partner header variants", () => {
   ]);
   assert.deepEqual(parseMinimumOrderQuantities(iek), [{ sku: "SKU-1", supplierArticle: "ART-1", productName: "Автомат", multiple: 12 }]);
   assert.deepEqual(parseMinimumOrderQuantities(systeme), [{ sku: "SKU-2", supplierArticle: "ART-2", productName: "Кабель", multiple: 5 }]);
+});
+
+test("reservation parser reads reserved customer stock and clamps negative values to zero", () => {
+  const bytes = workbookBytes([
+    [null, null, null, null],
+    ["№", "Код 1с", "Наименование", "Остаток", "Зарезервировано", "Свободный остаток"],
+    [1, "SKU-1", "Автомат", 20, 7, 13],
+    [2, "SKU-2", "Кабель", 10, -2, 12],
+  ]);
+  assert.deepEqual(parseSkuReservations(bytes), [
+    { sku: "SKU-1", reservedStock: 7 },
+    { sku: "SKU-2", reservedStock: 0 },
+  ]);
 });

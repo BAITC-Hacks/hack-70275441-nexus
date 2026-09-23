@@ -4,6 +4,7 @@ import type {
   MonthlyOpeningStock,
   MonthlySales,
   SalesTransaction,
+  SkuReservation,
   YearMonth,
 } from "./types.ts";
 
@@ -21,8 +22,8 @@ export interface ReplenishmentOptions {
   /** Required fallback: never hidden as a hard-coded lead time. */
   defaultLeadTimeMonths: number;
   reviewPeriodMonths: number;
-  /** Category -> safety-stock coverage in months. */
-  categorySafetyStockMonths: Record<string, number>;
+  /** Category -> target service level as a probability, e.g. 0.98. */
+  categoryServiceLevel: Record<string, number>;
   trendWindowMonths?: number;
   maxAbsoluteHistoricalGrowthRate?: number;
   stockoutOpeningStockThreshold?: number;
@@ -36,6 +37,7 @@ export interface ReplenishmentInput {
   salesTransactions: SalesTransaction[];
   skuConfigs: SkuPlanningConfig[];
   minimumOrderQuantities?: MinimumOrderQuantity[];
+  reservations?: SkuReservation[];
   options: ReplenishmentOptions;
 }
 
@@ -60,10 +62,14 @@ export interface ReplenishmentRecommendation {
   excludedSpikeUnits: number;
   excludedSpikeTransactionIds: string[];
   currentStock: number;
+  reservedStock: number;
+  availableStock: number;
   goodsInTransitWithinHorizon: number;
   leadTimeMonths: number;
   reviewPeriodMonths: number;
-  safetyStockMonths: number;
+  demandStdDev: number;
+  serviceLevel: number;
+  safetyStockZScore: number;
   safetyStock: number;
   targetPosition: number;
   currentPosition: number;
@@ -87,6 +93,25 @@ export interface ReplenishmentPlan {
 
 const average = (values: number[]): number => values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0;
 const round = (value: number): number => Number(value.toFixed(6));
+const SERVICE_LEVEL_Z = [
+  [0.9, 1.2816], [0.95, 1.6449], [0.975, 1.96], [0.98, 2.0537], [0.99, 2.3263], [0.995, 2.5758],
+] as const;
+
+export function serviceLevelZScore(serviceLevel: number): number {
+  if (!Number.isFinite(serviceLevel) || serviceLevel <= 0 || serviceLevel >= 1) throw new Error("Service level must be between 0 and 1.");
+  if (serviceLevel <= SERVICE_LEVEL_Z[0][0]) return SERVICE_LEVEL_Z[0][1];
+  if (serviceLevel >= SERVICE_LEVEL_Z.at(-1)![0]) return SERVICE_LEVEL_Z.at(-1)![1];
+  const upperIndex = SERVICE_LEVEL_Z.findIndex(([level]) => level >= serviceLevel);
+  const [lowerLevel, lowerZ] = SERVICE_LEVEL_Z[upperIndex - 1];
+  const [upperLevel, upperZ] = SERVICE_LEVEL_Z[upperIndex];
+  return lowerZ + (upperZ - lowerZ) * ((serviceLevel - lowerLevel) / (upperLevel - lowerLevel));
+}
+
+function standardDeviation(values: number[]): number {
+  if (!values.length) return 0;
+  const mean = average(values);
+  return Math.sqrt(average(values.map((value) => (value - mean) ** 2)));
+}
 
 function median(values: number[]): number {
   if (!values.length) return 0;
@@ -143,16 +168,31 @@ function validateInput(input: ReplenishmentInput): void {
     if (!config.sku || !config.supplier || !config.category) throw new Error("Every SKU config requires sku, supplier and category.");
     if (!Number.isFinite(config.forecastGrowthRate) || config.forecastGrowthRate <= -1) throw new Error(`Invalid forecastGrowthRate for ${config.sku}.`);
     if (config.leadTimeMonths !== undefined && config.leadTimeMonths <= 0) throw new Error(`Invalid leadTimeMonths for ${config.sku}.`);
-    const safetyMonths = options.categorySafetyStockMonths[config.category];
-    if (!Number.isFinite(safetyMonths) || safetyMonths < 0) throw new Error(`Missing category safety-stock policy for ${config.category}.`);
+    const serviceLevel = options.categoryServiceLevel[config.category];
+    if (!Number.isFinite(serviceLevel) || serviceLevel <= 0 || serviceLevel >= 1) throw new Error(`Missing category service-level policy for ${config.category}.`);
   }
 }
 
-function recommendationForSku(input: ReplenishmentInput, config: SkuPlanningConfig): ReplenishmentRecommendation {
+interface IndexedInput {
+  sales: Map<string, MonthlySales[]>;
+  stocks: Map<string, MonthlyOpeningStock[]>;
+  inbound: Map<string, InboundShipment[]>;
+  transactions: Map<string, SalesTransaction[]>;
+  moq: Map<string, MinimumOrderQuantity>;
+  reservations: Map<string, SkuReservation>;
+}
+
+function groupBySku<T extends { sku: string }>(rows: T[]): Map<string, T[]> {
+  const grouped = new Map<string, T[]>();
+  for (const row of rows) grouped.set(row.sku, [...(grouped.get(row.sku) ?? []), row]);
+  return grouped;
+}
+
+function recommendationForSku(input: ReplenishmentInput, indexed: IndexedInput, config: SkuPlanningConfig): ReplenishmentRecommendation {
   const { options } = input;
-  const sales = input.monthlySales.filter((item) => item.sku === config.sku && item.month <= options.asOfMonth).sort((a, b) => a.month.localeCompare(b.month));
+  const sales = (indexed.sales.get(config.sku) ?? []).filter((item) => item.month <= options.asOfMonth).sort((a, b) => a.month.localeCompare(b.month));
   if (!sales.length) throw new Error(`No monthly sales found for ${config.sku}.`);
-  const transactions = input.salesTransactions.filter((item) => item.sku === config.sku);
+  const transactions = indexed.transactions.get(config.sku) ?? [];
   const threshold = spikeThreshold(transactions);
   const spikes = transactions.filter((item) => item.unitsSold > threshold);
   const spikeUnitsByMonth = new Map<YearMonth, number>();
@@ -161,7 +201,8 @@ function recommendationForSku(input: ReplenishmentInput, config: SkuPlanningConf
     if (month) spikeUnitsByMonth.set(month, (spikeUnitsByMonth.get(month) ?? 0) + spike.unitsSold);
   }
   const cleaned = sales.map((item) => ({ ...item, unitsSold: Math.max(0, item.unitsSold - (spikeUnitsByMonth.get(item.month) ?? 0)) }));
-  const stockByMonth = new Map(input.openingStocks.filter((item) => item.sku === config.sku).map((item) => [item.month, item.openingStock]));
+  const skuStocks = indexed.stocks.get(config.sku) ?? [];
+  const stockByMonth = new Map(skuStocks.map((item) => [item.month, item.openingStock]));
   const stockoutThreshold = options.stockoutOpeningStockThreshold ?? 0;
   const neighborMinimum = options.stockoutNeighborDemandMinimum ?? 1;
   const stockoutMonths = cleaned.flatMap((item, index) => {
@@ -197,28 +238,33 @@ function recommendationForSku(input: ReplenishmentInput, config: SkuPlanningConf
   const stockoutCompensationFactor = rawMonthlyDemand > 0 ? Math.max(1, baseMonthlyDemand / rawMonthlyDemand) : 1;
   const adjustedDemandRate = baseMonthlyDemand * seasonalIndex * combinedGrowthFactor;
 
-  const stockRows = input.openingStocks.filter((item) => item.sku === config.sku && item.month <= options.asOfMonth).sort((a, b) => a.month.localeCompare(b.month));
+  const stockRows = skuStocks.filter((item) => item.month <= options.asOfMonth).sort((a, b) => a.month.localeCompare(b.month));
   const currentStock = stockRows.at(-1)?.openingStock ?? 0;
+  const reservedStock = indexed.reservations.get(config.sku)?.reservedStock ?? 0;
+  // IEK has no reservation field in the supplied files, so its documented fallback is zero reservation.
+  const availableStock = Math.max(0, currentStock - reservedStock);
   const leadTimeMonths = config.leadTimeMonths ?? options.defaultLeadTimeMonths;
   const horizonMonths = leadTimeMonths + options.reviewPeriodMonths;
   const horizonEnd = endOfMonth(addMonths(options.asOfMonth, Math.ceil(horizonMonths)));
-  const goodsInTransitWithinHorizon = input.inboundShipments
-    .filter((item) => item.sku === config.sku && (item.expectedDate === null || Date.parse(item.expectedDate) <= horizonEnd))
+  const goodsInTransitWithinHorizon = (indexed.inbound.get(config.sku) ?? [])
+    .filter((item) => item.expectedDate === null || Date.parse(item.expectedDate) <= horizonEnd)
     .reduce((sum, item) => sum + item.quantity, 0);
-  const safetyStockMonths = options.categorySafetyStockMonths[config.category];
-  const safetyStock = adjustedDemandRate * safetyStockMonths;
+  const demandStdDev = standardDeviation(demandWithoutStockouts.map((item) => item.unitsSold));
+  const serviceLevel = options.categoryServiceLevel[config.category];
+  const safetyStockZScore = serviceLevelZScore(serviceLevel);
+  const safetyStock = safetyStockZScore * demandStdDev * Math.sqrt(horizonMonths);
 
   /**
    * Deterministic replenishment formula from the case specification:
    * target_position = cleaned_seasonal_growth_adjusted_demand_rate
    *   * (lead_time_months + review_period_months) + safety_stock
-   * current_position = current_stock + goods_in_transit_within_horizon
+   * current_position = max(0, current_stock - reserved_stock) + goods_in_transit_within_horizon
    * recommended_order = max(0, target_position - current_position)
    */
   const targetPosition = adjustedDemandRate * horizonMonths + safetyStock;
-  const currentPosition = currentStock + goodsInTransitWithinHorizon;
+  const currentPosition = availableStock + goodsInTransitWithinHorizon;
   const recommendedOrderBeforeMoq = Math.max(0, targetPosition - currentPosition);
-  const moqMultiple = input.minimumOrderQuantities?.find((item) => item.sku === config.sku)?.multiple ?? null;
+  const moqMultiple = indexed.moq.get(config.sku)?.multiple ?? null;
   const recommendedOrder = moqMultiple && recommendedOrderBeforeMoq > 0
     ? Math.ceil(recommendedOrderBeforeMoq / moqMultiple) * moqMultiple
     : recommendedOrderBeforeMoq;
@@ -246,10 +292,14 @@ function recommendationForSku(input: ReplenishmentInput, config: SkuPlanningConf
     excludedSpikeUnits: round(spikes.reduce((sum, item) => sum + item.unitsSold, 0)),
     excludedSpikeTransactionIds: spikes.map((item) => item.invoiceNumber),
     currentStock: round(currentStock),
+    reservedStock: round(reservedStock),
+    availableStock: round(availableStock),
     goodsInTransitWithinHorizon: round(goodsInTransitWithinHorizon),
     leadTimeMonths: round(leadTimeMonths),
     reviewPeriodMonths: round(options.reviewPeriodMonths),
-    safetyStockMonths: round(safetyStockMonths),
+    demandStdDev: round(demandStdDev),
+    serviceLevel: round(serviceLevel),
+    safetyStockZScore: round(safetyStockZScore),
     safetyStock: round(safetyStock),
     targetPosition: round(targetPosition),
     currentPosition: round(currentPosition),
@@ -263,7 +313,17 @@ function recommendationForSku(input: ReplenishmentInput, config: SkuPlanningConf
 
 export function calculateReplenishment(input: ReplenishmentInput): ReplenishmentPlan {
   validateInput(input);
-  const recommendations = input.skuConfigs.map((config) => recommendationForSku(input, config));
+  // Build each index once. Real partner workbooks contain hundreds of thousands of transactions; repeated
+  // whole-array filtering per SKU would make the browser workflow quadratic and unsuitable for Vercel.
+  const indexed: IndexedInput = {
+    sales: groupBySku(input.monthlySales),
+    stocks: groupBySku(input.openingStocks),
+    inbound: groupBySku(input.inboundShipments),
+    transactions: groupBySku(input.salesTransactions),
+    moq: new Map(input.minimumOrderQuantities?.map((item) => [item.sku, item])),
+    reservations: new Map(input.reservations?.map((item) => [item.sku, item])),
+  };
+  const recommendations = input.skuConfigs.map((config) => recommendationForSku(input, indexed, config));
   const suppliers = [...new Set(recommendations.map((item) => item.supplier))].sort().map((supplier) => {
     const items = recommendations.filter((item) => item.supplier === supplier).sort((a, b) => a.sku.localeCompare(b.sku));
     return { supplier, items, totalRecommendedUnits: round(items.reduce((sum, item) => sum + item.recommendedOrder, 0)) };

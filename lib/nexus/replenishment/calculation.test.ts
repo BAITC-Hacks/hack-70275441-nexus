@@ -23,7 +23,7 @@ function baseInput(): ReplenishmentInput {
       asOfMonth: "2025-12",
       defaultLeadTimeMonths: 2,
       reviewPeriodMonths: 1,
-      categorySafetyStockMonths: { A: 1, B: 0.25 },
+      categoryServiceLevel: { A: 0.98, B: 0.95, C: 0.9 },
       trendWindowMonths: 3,
     },
   };
@@ -55,7 +55,9 @@ test("criterion 1 — changing goods in transit changes the recommendation", () 
 test("criterion 1 — changing category changes category safety stock and the recommendation", () => {
   const categoryA = baseInput();
   const categoryB = baseInput();
-  categoryB.skuConfigs[0] = { ...categoryB.skuConfigs[0], category: "B" };
+  categoryA.monthlySales = sales([50, 150, 50, 150, 50, 150]);
+  categoryB.monthlySales = sales([50, 150, 50, 150, 50, 150]);
+  categoryB.skuConfigs[0] = { ...categoryB.skuConfigs[0], category: "C" };
   assert.ok(first(categoryA).safetyStock > first(categoryB).safetyStock);
   assert.notEqual(first(categoryA).recommendedOrder, first(categoryB).recommendedOrder);
 });
@@ -84,8 +86,8 @@ test("criterion 3 — inferred stockout excludes constrained demand and corrects
   raw.monthlySales = sales([100, 100, 0, 100, 100, 100]);
   raw.openingStocks = stocks([10, 10, 10, 10, 10, 20]);
   raw.options.maxAbsoluteHistoricalGrowthRate = 0;
-  raw.options.categorySafetyStockMonths = { A: 0 };
-  raw.options.defaultLeadTimeMonths = 1;
+  raw.options.categoryServiceLevel = { A: 0.95 };
+  raw.options.defaultLeadTimeMonths = 24;
   raw.options.reviewPeriodMonths = 0;
   // asOfMonth is deliberately a calendar month (January) with no prior same-calendar-month history among
   // the 6 recorded months (all Jul-Dec) — this keeps seasonalIndex at its neutral fallback (1) so the
@@ -107,7 +109,7 @@ test("criterion 4 — a one-off large transaction is excluded from regular deman
   const baseline = baseInput();
   baseline.openingStocks = stocks([10, 10, 10, 10, 10, 0]);
   baseline.options.maxAbsoluteHistoricalGrowthRate = 0;
-  baseline.options.categorySafetyStockMonths = { A: 0 };
+  baseline.options.categoryServiceLevel = { A: 0.95 };
   baseline.options.defaultLeadTimeMonths = 1;
   baseline.options.reviewPeriodMonths = 0;
   const withSpike = structuredClone(baseline);
@@ -130,8 +132,35 @@ test("criterion 5 — results are grouped by supplier and expose urgency and eve
   const urgent = plan.suppliers[0].items[0];
   assert.equal(urgent.urgency, "high");
   assert.equal(urgent.recommendedOrder % 25, 0);
-  for (const key of ["baseMonthlyDemand", "seasonalIndex", "historicalGrowthRate", "forecastGrowthRate", "stockoutAdjustmentUnitsPerMonth", "currentStock", "goodsInTransitWithinHorizon", "excludedSpikeUnits"] as const) {
+  for (const key of ["baseMonthlyDemand", "seasonalIndex", "historicalGrowthRate", "forecastGrowthRate", "stockoutAdjustmentUnitsPerMonth", "currentStock", "reservedStock", "availableStock", "goodsInTransitWithinHorizon", "excludedSpikeUnits", "demandStdDev", "serviceLevel", "safetyStockZScore"] as const) {
     assert.equal(typeof urgent[key], "number", `${key} must be exposed`);
   }
   assert.equal(plan.suppliers[1].items[0].urgency, "low");
+});
+
+test("volatile demand receives more safety stock than stable demand with the same mean and service level", () => {
+  const stable = baseInput(), volatile = baseInput();
+  volatile.monthlySales = sales([50, 150, 50, 150, 50, 150]);
+  const stableResult = first(stable), volatileResult = first(volatile);
+  assert.equal(stableResult.baseMonthlyDemand, volatileResult.baseMonthlyDemand);
+  assert.ok(volatileResult.demandStdDev > stableResult.demandStdDev);
+  assert.ok(volatileResult.safetyStock > stableResult.safetyStock);
+});
+
+test("higher category service level produces more safety stock at equal volatility", () => {
+  const high = baseInput(), low = baseInput();
+  high.monthlySales = sales([50, 150, 50, 150, 50, 150]);
+  low.monthlySales = sales([50, 150, 50, 150, 50, 150]);
+  low.skuConfigs[0] = { ...low.skuConfigs[0], category: "C" };
+  assert.ok(first(high).safetyStockZScore > first(low).safetyStockZScore);
+  assert.ok(first(high).safetyStock > first(low).safetyStock);
+});
+
+test("reserved customer stock reduces availability and increases the recommended order", () => {
+  const withoutReservation = baseInput(), withReservation = baseInput();
+  withReservation.reservations = [{ sku: "SKU-1", reservedStock: 15 }];
+  const baseline = first(withoutReservation), reserved = first(withReservation);
+  assert.equal(reserved.availableStock, 5);
+  assert.equal(reserved.currentPosition, baseline.currentPosition - 15);
+  assert.ok(reserved.recommendedOrder > baseline.recommendedOrder);
 });

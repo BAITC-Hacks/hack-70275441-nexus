@@ -5,6 +5,8 @@ import type {
   MonthlyOpeningStock,
   MonthlySales,
   SalesTransaction,
+  SkuCategory,
+  SkuReservation,
   XlsxInput,
   YearMonth,
 } from "./types.ts";
@@ -238,5 +240,32 @@ export function parseMinimumOrderQuantities(input: XlsxInput, sheetName?: string
       productName: text(row[product]),
       multiple: multipleValue,
     }];
+  });
+}
+
+/** Reads partner-provided category metadata when it exists (currently the Systeme Electric dashboard). */
+export function parseSkuCategories(input: XlsxInput, sheetName?: string): SkuCategory[] {
+  const rows = rowsFromWorkbook(input, sheetName);
+  const headerIndex = findHeaderRow(rows, [/код 1с/, /категория/]);
+  const header = rows[headerIndex];
+  const sku = requireColumn(header, [/^код 1с$/], "Код 1с");
+  const category = requireColumn(header, [/^категория(?: 20\d{2})?$/], "Категория");
+  return rows.slice(headerIndex + 1).flatMap((row) => {
+    const skuValue = text(row[sku]), categoryValue = text(row[category]);
+    return skuValue && categoryValue ? [{ sku: skuValue, category: categoryValue }] : [];
+  });
+}
+
+/** Reads customer-reserved stock from the Systeme Electric dashboard. IEK has no equivalent source. */
+export function parseSkuReservations(input: XlsxInput, sheetName?: string): SkuReservation[] {
+  const rows = rowsFromWorkbook(input, sheetName);
+  const headerIndex = findHeaderRow(rows, [/код 1с/, /^зарезервировано$/]);
+  const header = rows[headerIndex];
+  const sku = requireColumn(header, [/^код 1с$/], "Код 1с");
+  const reserved = requireColumn(header, [/^зарезервировано$/], "Зарезервировано");
+  return rows.slice(headerIndex + 1).flatMap((row) => {
+    const skuValue = text(row[sku]);
+    const reservedValue = numberValue(row[reserved]);
+    return skuValue && reservedValue !== null ? [{ sku: skuValue, reservedStock: Math.max(0, reservedValue) }] : [];
   });
 }

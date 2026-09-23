@@ -49,4 +49,14 @@ export interface MinimumOrderQuantity {
   multiple: number;
 }
 
+export interface SkuCategory {
+  sku: string;
+  category: string;
+}
+
+export interface SkuReservation {
+  sku: string;
+  reservedStock: number;
+}
+
 export type XlsxInput = ArrayBuffer | Uint8Array;
