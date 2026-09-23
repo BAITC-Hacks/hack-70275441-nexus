@@ -42,6 +42,14 @@ const recommendation: ReplenishmentNarrationInput = {
   nonZeroDemandFrequency: 1,
   forecastMethod: "seasonal_trend",
   exceptions: ["one_off_spike"],
+  planningMonthlyDemand: 12.5,
+  stockLifecycleStatus: "active",
+  daysOfSupply: 38.96,
+  isOverstock: false,
+  overstockMonths: 0,
+  nearestInboundExpectedDate: "2026-10-11",
+  projectedStockoutDate: "2026-10-04",
+  potentialStockoutDays: 7,
 };
 
 test("narration API returns FALLBACK instead of failing when the API key is absent", async () => {

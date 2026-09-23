@@ -43,7 +43,8 @@ export interface ReplenishmentInput {
 
 export type ReplenishmentUrgency = "high" | "medium" | "low";
 export type DemandPattern = "stable" | "volatile" | "intermittent";
-export type ReplenishmentException = "stockout" | "one_off_spike" | "sustained_growth_signal" | "unknown_eta" | "inbound_after_horizon" | "surplus";
+export type ReplenishmentException = "stockout" | "one_off_spike" | "sustained_growth_signal" | "unknown_eta" | "inbound_after_horizon" | "surplus" | "slow_stock" | "dead_stock";
+export type StockLifecycleStatus = "active" | "slow" | "dead";
 
 export interface ReplenishmentRecommendation {
   sku: string;
@@ -57,6 +58,8 @@ export interface ReplenishmentRecommendation {
   forecastGrowthRate: number;
   combinedGrowthFactor: number;
   adjustedDemandRate: number;
+  planningMonthlyDemand: number;
+  stockLifecycleStatus: StockLifecycleStatus;
   stockoutAdjustmentUnitsPerMonth: number;
   stockoutCompensationFactor: number;
   stockoutMonths: YearMonth[];
@@ -85,6 +88,12 @@ export interface ReplenishmentRecommendation {
   moqMultiple: number | null;
   recommendedOrder: number;
   coverageMonths: number | null;
+  daysOfSupply: number | null;
+  isOverstock: boolean;
+  overstockMonths: number;
+  nearestInboundExpectedDate: string | null;
+  projectedStockoutDate: string | null;
+  potentialStockoutDays: number | null;
   urgency: ReplenishmentUrgency;
   demandPattern: DemandPattern;
   nonZeroDemandFrequency: number;
@@ -168,6 +177,10 @@ function endOfMonth(month: YearMonth): number {
   return Date.UTC(year, monthNumber, 1) - 1;
 }
 
+const DAY_MS = 86_400_000;
+const DAYS_PER_MONTH = 30.4375;
+const isoDay = (timestamp: number): string => new Date(timestamp).toISOString().slice(0, 10);
+
 function clamp(value: number, minimum: number, maximum: number): number {
   return Math.min(maximum, Math.max(minimum, value));
 }
@@ -243,10 +256,22 @@ function recommendationForSku(input: ReplenishmentInput, indexed: IndexedInput, 
     ? "intermittent"
     : coefficientOfVariation >= 0.75 ? "volatile" : "stable";
   const forecastMethod = demandPattern === "intermittent" ? "intermittent_rate" : "seasonal_trend";
+  const lifecycleRecent = demandValues.slice(-3);
+  const lifecycleEarlier = demandValues.slice(0, -3);
+  const lifecycleRecentAverage = average(lifecycleRecent);
+  const lifecycleEarlierAverage = average(lifecycleEarlier);
+  const stockLifecycleStatus: StockLifecycleStatus = lifecycleEarlier.length && lifecycleEarlierAverage >= 1
+    ? lifecycleRecentAverage <= lifecycleEarlierAverage * 0.1
+      ? "dead"
+      : lifecycleRecentAverage <= lifecycleEarlierAverage * 0.35 ? "slow" : "active"
+    : "active";
+  // Slow stock plans from the latest observed run rate; dead stock is blocked from automatic purchasing.
+  const planningMonthlyDemand = stockLifecycleStatus === "dead" ? 0
+    : stockLifecycleStatus === "slow" ? lifecycleRecentAverage : baseMonthlyDemand;
 
   const calendarMonth = Number(options.asOfMonth.slice(5, 7));
   const sameCalendarMonth = demandWithoutStockouts.filter((item) => Number(item.month.slice(5, 7)) === calendarMonth);
-  const seasonalIndex = forecastMethod === "seasonal_trend" && baseMonthlyDemand > 0 && sameCalendarMonth.length
+  const seasonalIndex = stockLifecycleStatus === "active" && forecastMethod === "seasonal_trend" && baseMonthlyDemand > 0 && sameCalendarMonth.length
     ? average(sameCalendarMonth.map((item) => item.unitsSold)) / baseMonthlyDemand
     : 1;
 
@@ -256,7 +281,7 @@ function recommendationForSku(input: ReplenishmentInput, indexed: IndexedInput, 
   const earlierAverage = average(earlier), recentAverage = average(recent);
   // Sparse demand uses an occurrence-rate model; a short run of zero/non-zero months is not treated as
   // a continuous trend because that would amplify timing noise as growth.
-  const rawHistoricalGrowth = forecastMethod === "intermittent_rate"
+  const rawHistoricalGrowth = stockLifecycleStatus !== "active" || forecastMethod === "intermittent_rate"
     ? 0
     : earlierAverage > 0 && earlier.length ? recentAverage / earlierAverage - 1 : 0;
   const growthLimit = options.maxAbsoluteHistoricalGrowthRate ?? 0.5;
@@ -268,7 +293,7 @@ function recommendationForSku(input: ReplenishmentInput, indexed: IndexedInput, 
   // the rate again, or the compensation is effectively applied twice (once by exclusion, once by this
   // factor), inflating the recommendation beyond what the data supports.
   const stockoutCompensationFactor = rawMonthlyDemand > 0 ? Math.max(1, baseMonthlyDemand / rawMonthlyDemand) : 1;
-  const adjustedDemandRate = baseMonthlyDemand * seasonalIndex * combinedGrowthFactor;
+  const adjustedDemandRate = planningMonthlyDemand * seasonalIndex * combinedGrowthFactor;
 
   const stockRows = skuStocks.filter((item) => item.month <= options.asOfMonth).sort((a, b) => a.month.localeCompare(b.month));
   const currentStock = stockRows.at(-1)?.openingStock ?? 0;
@@ -287,7 +312,7 @@ function recommendationForSku(input: ReplenishmentInput, indexed: IndexedInput, 
   const demandStdDev = preliminaryStdDev;
   const serviceLevel = options.categoryServiceLevel[config.category];
   const safetyStockZScore = serviceLevelZScore(serviceLevel);
-  const safetyStock = safetyStockZScore * demandStdDev * Math.sqrt(horizonMonths);
+  const safetyStock = stockLifecycleStatus === "dead" ? 0 : safetyStockZScore * demandStdDev * Math.sqrt(horizonMonths);
 
   /**
    * Deterministic replenishment formula from the case specification:
@@ -298,12 +323,24 @@ function recommendationForSku(input: ReplenishmentInput, indexed: IndexedInput, 
    */
   const targetPosition = adjustedDemandRate * horizonMonths + safetyStock;
   const currentPosition = availableStock + goodsInTransitWithinHorizon;
-  const recommendedOrderBeforeMoq = Math.max(0, targetPosition - currentPosition);
+  const recommendedOrderBeforeMoq = stockLifecycleStatus === "dead" ? 0 : Math.max(0, targetPosition - currentPosition);
   const moqMultiple = indexed.moq.get(config.sku)?.multiple ?? null;
   const recommendedOrder = moqMultiple && recommendedOrderBeforeMoq > 0
     ? Math.ceil(recommendedOrderBeforeMoq / moqMultiple) * moqMultiple
     : recommendedOrderBeforeMoq;
   const coverageMonths = adjustedDemandRate > 0 ? currentPosition / adjustedDemandRate : null;
+  const daysOfSupply = adjustedDemandRate > 0 ? availableStock / adjustedDemandRate * DAYS_PER_MONTH : null;
+  const isOverstock = coverageMonths !== null && coverageMonths > horizonMonths * 2;
+  const overstockMonths = isOverstock ? coverageMonths - horizonMonths : 0;
+  const planningTimestamp = endOfMonth(options.asOfMonth) + 1;
+  const nearestInboundExpectedDate = skuInbound
+    .flatMap((item) => item.expectedDate && Date.parse(item.expectedDate) >= planningTimestamp ? [item.expectedDate] : [])
+    .sort()[0] ?? null;
+  const projectedStockoutTimestamp = daysOfSupply === null ? null : planningTimestamp + Math.ceil(daysOfSupply) * DAY_MS;
+  const projectedStockoutDate = projectedStockoutTimestamp === null ? null : isoDay(projectedStockoutTimestamp);
+  const potentialStockoutDays = projectedStockoutTimestamp !== null && nearestInboundExpectedDate
+    ? Math.max(0, Math.ceil((Date.parse(nearestInboundExpectedDate) - projectedStockoutTimestamp) / DAY_MS))
+    : null;
   const urgency: ReplenishmentUrgency = coverageMonths !== null && coverageMonths < leadTimeMonths
     ? "high"
     : coverageMonths !== null && coverageMonths < horizonMonths ? "medium" : "low";
@@ -313,7 +350,9 @@ function recommendationForSku(input: ReplenishmentInput, indexed: IndexedInput, 
     ...(retainedGrowthSpikes.length ? ["sustained_growth_signal" as const] : []),
     ...(goodsInTransitUnknownEta > 0 ? ["unknown_eta" as const] : []),
     ...(goodsInTransitAfterHorizon > 0 ? ["inbound_after_horizon" as const] : []),
-    ...(coverageMonths !== null && coverageMonths > horizonMonths * 2 ? ["surplus" as const] : []),
+    ...(isOverstock ? ["surplus" as const] : []),
+    ...(stockLifecycleStatus === "slow" ? ["slow_stock" as const] : []),
+    ...(stockLifecycleStatus === "dead" ? ["dead_stock" as const] : []),
   ];
 
   return {
@@ -328,6 +367,8 @@ function recommendationForSku(input: ReplenishmentInput, indexed: IndexedInput, 
     forecastGrowthRate: round(config.forecastGrowthRate),
     combinedGrowthFactor: round(combinedGrowthFactor),
     adjustedDemandRate: round(adjustedDemandRate),
+    planningMonthlyDemand: round(planningMonthlyDemand),
+    stockLifecycleStatus,
     stockoutAdjustmentUnitsPerMonth: round(baseMonthlyDemand - rawMonthlyDemand),
     stockoutCompensationFactor: round(stockoutCompensationFactor),
     stockoutMonths,
@@ -356,6 +397,12 @@ function recommendationForSku(input: ReplenishmentInput, indexed: IndexedInput, 
     moqMultiple,
     recommendedOrder: round(recommendedOrder),
     coverageMonths: coverageMonths === null ? null : round(coverageMonths),
+    daysOfSupply: daysOfSupply === null ? null : round(daysOfSupply),
+    isOverstock,
+    overstockMonths: round(overstockMonths),
+    nearestInboundExpectedDate,
+    projectedStockoutDate,
+    potentialStockoutDays,
     urgency,
     demandPattern,
     nonZeroDemandFrequency: round(nonZeroDemandFrequency),

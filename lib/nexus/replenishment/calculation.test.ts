@@ -209,3 +209,41 @@ test("unknown and late inbound ETA are exposed as planning exceptions", () => {
   assert.ok(result.exceptions.includes("unknown_eta"));
   assert.ok(result.exceptions.includes("inbound_after_horizon"));
 });
+
+test("days of supply and stockout gap are expressed as calendar dates and days", () => {
+  const input = baseInput();
+  input.inboundShipments = [{ sku: "SKU-1", productName: "SKU-1", shipmentId: "JAN", expectedDate: "2026-01-15", quantity: 100 }];
+  const result = first(input);
+  assert.ok(result.daysOfSupply !== null && result.daysOfSupply > 6 && result.daysOfSupply < 7);
+  assert.equal(result.projectedStockoutDate, "2026-01-08");
+  assert.equal(result.nearestInboundExpectedDate, "2026-01-15");
+  assert.equal(result.potentialStockoutDays, 7);
+});
+
+test("overstock produces an explicit do-not-order result", () => {
+  const input = baseInput();
+  input.openingStocks = stocks([20, 20, 20, 20, 20, 1000]);
+  const result = first(input);
+  assert.equal(result.isOverstock, true);
+  assert.ok(result.overstockMonths > 0);
+  assert.equal(result.recommendedOrder, 0);
+  assert.ok(result.exceptions.includes("surplus"));
+});
+
+test("dead stock blocks automatic replenishment and slow stock uses recent demand", () => {
+  const dead = baseInput();
+  dead.monthlySales = sales([100, 100, 100, 0, 0, 0]);
+  dead.openingStocks = stocks([20, 20, 20, 20, 20, 20]);
+  const deadResult = first(dead);
+  assert.equal(deadResult.stockLifecycleStatus, "dead");
+  assert.equal(deadResult.planningMonthlyDemand, 0);
+  assert.equal(deadResult.recommendedOrder, 0);
+  assert.ok(deadResult.exceptions.includes("dead_stock"));
+
+  const slow = baseInput();
+  slow.monthlySales = sales([100, 100, 100, 30, 30, 30]);
+  const slowResult = first(slow);
+  assert.equal(slowResult.stockLifecycleStatus, "slow");
+  assert.equal(slowResult.planningMonthlyDemand, 30);
+  assert.ok(slowResult.exceptions.includes("slow_stock"));
+});
