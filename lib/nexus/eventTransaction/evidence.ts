@@ -1,0 +1,14 @@
+import type { EvidenceRecord } from "../agentic/types.ts";
+import type { EventTransactionAnalysis } from "./types.ts";
+
+export function buildEventTransactionEvidence(analysis: EventTransactionAnalysis): EvidenceRecord[] {
+  return [
+    { id: "E-001", tool: "profile_event_transaction_dataset", variables: Object.values(analysis.semantics).filter((item): item is string => Boolean(item)), result: `Профилировано ${analysis.dataset.eventCount} исходных событий из ${analysis.dataset.name}; отпечаток ${analysis.dataset.version}.`, data: { dataset: analysis.dataset, semantics: analysis.semantics, profile: analysis.profile }, usedBy: ["OBSERVER"] },
+    { id: "E-002", tool: "summarize_event_types", variables: [analysis.semantics.eventTypeColumn], result: `Обобщено ${analysis.eventTypes.length} типов событий с точными исходными количествами.`, data: { eventTypes: analysis.eventTypes }, usedBy: ["OBSERVER", "INVESTIGATOR", "SKEPTIC"] },
+    { id: "E-003", tool: "summarize_entity_activity", variables: analysis.semantics.entityColumn ? [analysis.semantics.entityColumn] : [], result: `Обобщено ${analysis.profile.uniqueEntities} групп активности сущностей по исходным строкам.`, data: { entityActivity: analysis.entityActivity }, usedBy: ["OBSERVER", "INVESTIGATOR", "SKEPTIC"] },
+    { id: "E-004", tool: "summarize_event_timing", variables: [analysis.semantics.timestampColumn], result: `${analysis.timing.bursts.length} скоплений одной сущности соответствуют опубликованному правилу пяти минут.`, data: { timing: analysis.timing }, usedBy: ["OBSERVER", "INVESTIGATOR", "SKEPTIC"] },
+    { id: "E-005", tool: "detect_repeated_patterns", variables: [analysis.semantics.eventTypeColumn, ...(analysis.semantics.valueColumn ? [analysis.semantics.valueColumn] : [])], result: `${analysis.detection.repeatedPatterns.length} повторяющихся шаблонов сущность/тип/значение соответствуют опубликованному правилу пяти минут.`, data: { repeatedPatterns: analysis.detection.repeatedPatterns, rareEventTypes: analysis.detection.rareEventTypes, valueBounds: analysis.detection.valueBounds }, usedBy: ["OBSERVER", "INVESTIGATOR", "SKEPTIC"] },
+    { id: "E-006", tool: "detect_notable_events", variables: [], result: `${analysis.detection.notableEvents.length} исходных событий соответствуют хотя бы одному опубликованному детерминированному правилу внимания.`, data: { notableEvents: analysis.detection.notableEvents }, usedBy: ["OBSERVER", "INVESTIGATOR", "SKEPTIC"] },
+    { id: "E-007", tool: "correlate_related_events", variables: [], result: `Сформировано ${analysis.clusters.length} нейтральных групп активности одной сущности; у ${analysis.highlightedEntities.length} сущностей есть детерминированные причины внимания.`, data: { clusters: analysis.clusters, highlightedEntities: analysis.highlightedEntities }, usedBy: ["OBSERVER", "INVESTIGATOR", "SKEPTIC"] },
+  ];
+}
