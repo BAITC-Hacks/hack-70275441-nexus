@@ -1,229 +1,141 @@
-# NEXUS → Электрокомплект: автоматический расчёт заказов поставщикам
+# Nexus Автозаказ
 
-## Статус: HackAlem AI, кейс «Электрокомплект» (Логистика)
+**Автоматический расчёт заказов поставщикам для пополнения склада.** Кейс ТОО «Электрокомплект» (ekt.kz), хакатон HackAlem AI, трек «Логистика».
 
-Идёт активная разработка решения кейса **«Автоматический расчёт заказов поставщикам для пополнения
-склада»** (партнёр — ТОО «Электрокомплект») поверх инфраструктуры, описанной ниже. Это калькулятор
-пополнения склада, а не система расследования риска — итоговый продукт получит своё точное имя и тэглайн
-здесь же, когда расчётный модуль будет готов (Час 4).
+**Живой деплой: https://nexus-electrokomplekt.vercel.app/replenishment**
 
-Секции 1–21 этого файла ниже описывают базовый харнесс **как он был до начала соревновательной части**
-(изначально спроектирован как generic risk-investigation движок — этим объясняется терминология «risk» в
-них, это честное описание уже существовавшей инфраструктуры, а не текущего продукта). Раздел «Disclosure»
-объясняет, что подготовлено заранее, а что строится сейчас. Полный README под конкретный кейс (методология
-расчёта, инструкция запуска, пример проверки) заменит эту заметку и заголовок к концу отведённого времени.
+## 1. Проблема
 
-## Disclosure: что подготовлено до соревновательной части
+Менеджер отдела закупа ТОО «Электрокомплект» сегодня вручную считает пополнение склада в Excel: сводит историю продаж, остатки и товар в пути по каждому артикулу. Это трудоёмко, поэтому расчёт проводится нечасто и не в реальном времени — отсюда избыточные запасы по одним позициям и дефицит по другим. Разовые крупные заказы (в том числе продажа большого объёма одному клиенту) искажают расчёт регулярной потребности и дополнительно портят картину.
 
-Согласно Положению §6.4 (обязательное раскрытие использования ранее созданного кода) — этот проект
-построен поверх переиспользуемой, доменно-нейтральной инфраструктуры («харнесс»), подготовленной командой
-заранее с помощью Claude Code (AI-агент для разработки; разрешено согласно §6.9):
+## 2. Что реализовано
 
-- Next.js-каркас приложения и конфигурация деплоя.
-- Слой приёма данных: разбор CSV/XLSX (устойчивый к кавычкам, многолистовой, с учётом русских форматов дат,
-  разделителей тысяч и локализованных заголовков).
-- Агентный паттерн расследования — LLM-цикл Investigator/Skeptic, выбирающий детерминированный инструмент,
-  поверх слоя Evidence с независимой перепроверкой, так что LLM не может выдумать число, попадающее на
-  экран результата.
-- Универсальный статистический движок (корреляция со сканированием лагов, доверительные интервалы
-  Фишера-z, moving-block bootstrap, поправка Холма на значимость).
-- Механизм Domain Registry для сопоставления колонок датасета со словарём метрик домена — на момент старта
-  заполнен только словарными записями (без бизнес-логики, без датасета, без решённой задачи) для Retail,
-  Logistics, Manufacturing и Mining.
-- Слой контролируемого экспорта/PDF-отчёта.
+Сервис читает исходные книги обоих поставщиков (IEK и Systeme Electric), считает по каждому SKU регулярный спрос очищенным от аномалий способом и выдаёт конкретную рекомендацию — сколько и у какого поставщика заказать, с числовым обоснованием и меткой срочности.
 
-**Никакой доменной бизнес-логики, датасета или решённой задачи в этой базе не было.** Специально для
-выбранного кейса — **Логистика, «Электрокомплект»** — во время соревновательной части строится:
+Все пять официальных обязательных требований кейса реализованы и покрыты отдельными тестами:
 
-- [ ] Адаптер схемы под реальные данные кейса (продажи, остатки, товар в пути, MOQ) — `lib/nexus/replenishment/`
-- [ ] Расчёт сезонности, устойчивого роста спроса и компенсации упущенного спроса при stockout
-- [ ] Детерминированное исключение разовых крупных заказов из регулярного спроса
-- [ ] Формула рекомендованного заказа (детерминированная, не через LLM — см. обоснование в коде)
-- [ ] Итоговый список по поставщикам с обоснованием и срочностью, экспорт
+1. **Расчёт использует все источники данных** — историю продаж, остатки, товар в пути, категорию, внешний прогноз прироста; изменение любого из них меняет результат (проверено тестами по каждому источнику отдельно).
+2. **Сезонность и устойчивый рост** — сезонный индекс по календарным месяцам поверх очищенного ряда, плюс ограниченный (±50%) исторический тренд, комбинированный с внешним прогнозом.
+3. **Компенсация упущенного спроса при дефиците** — месяцы с околонулевым остатком при ненулевом спросе в соседних периодах исключаются из знаменателя среднего, а не считаются нулевым спросом.
+4. **Исключение разовых крупных заказов** — на уровне отдельных транзакций, устойчивой статистикой (медиана + MAD/IQR, не среднее и стандартное отклонение, которые сами чувствительны к выбросам).
+5. **Итоговый список по поставщикам с обоснованием и срочностью** — каждая строка сопровождается числовым разбором (спрос, сезонность, рост, поправка на дефицит, исключённые всплески, остаток, резерв, товар в пути, страховой запас) и меткой high/medium/low.
 
-Список выше обновляется по мере продвижения — коммиты в этом репозитории с официального старта
-соревновательной части отражают эту работу.
+Дополнительно, по итогам сверки с партнёром реализовано сверх изначального минимума:
+- **Страховой запас от статистической волатильности спроса**, а не фиксированная доля от среднего: `z(уровень_сервиса) × σ(спрос) × √(срок_поставки + период_пересмотра)`, с уровнем сервиса по категории (98% / 95% / 90%).
+- **Резервы под клиентов** вычитаются из доступного остатка там, где эти данные есть (`Остаток − Резерв`).
+- **Опциональное LLM-обоснование** поверх уже посчитанных чисел (кнопка «Получить объяснение от ИИ» на каждой строке) — LLM только формулирует текст на русском, не пересчитывает и не изменяет ни одного числа.
 
-## 1. Problem
+## 3. Как это работает
 
-Most monitoring dashboards answer "is a metric above a threshold?" They rarely answer the two questions an analyst, credit officer, or site manager actually needs:
-
-- *Why* is this metric moving — which other signals moved first, and by how much lead time?
-- *How sure should I be* — is this a statistically real, still-unproven association, or noise?
-
-A red KPI tile does not investigate itself. Someone still has to pull the data, check what moved earlier, sanity-check the story against an alternative explanation, and decide whether it is worth acting on.
-
-## 2. Who has this problem
-
-Anyone who owns a recurring risk metric and gets only the metric, not the investigation behind it — the
-original design targets (construction schedule risk, credit portfolio risk, government service backlogs)
-predate the verticals removed from this repository (see §12/§14) and no longer have a working tool pack
-here.
-
-**This hackathon's actual user** is a **purchasing manager** (менеджер отдела закупа) at ТОО
-«Электрокомплект», who today computes warehouse replenishment by hand in Excel — see the Status/Disclosure
-section at the top of this file for the real case being solved.
-
-## 3. Why monitoring alone is insufficient
-
-## 3. Why monitoring alone is insufficient
-
-A threshold alert tells you *that* something is wrong. It does not tell you which upstream signal moved first, whether that lead time is statistically meaningful given the sample size, or what a skeptical second reviewer would say before anyone acts on it. Doing that by hand, per metric, per report cycle, does not scale — and doing it with an LLM alone (no deterministic check) means numbers can be hallucinated.
-
-## 4. Solution
-
-NEXUS takes an uploaded (or prepared) dataset and runs a bounded, explainable investigation: it detects what changed, lets an LLM **Investigator** choose which deterministic tool to run next, computes every number with ordinary statistics (Pearson correlation, lag scanning, Holm-corrected significance, bootstrap stability), has an LLM **Skeptic** attempt to challenge the resulting hypothesis, deterministically **validates** the whole artifact by recomputing it from the raw data, and only then offers a **controlled export** — never an autonomous action.
-
-## 5. How NEXUS works
-
-```text
-Data → Detect → Investigate → Evidence → Challenge → Validate → Act
+```
+Загрузка 10 XLSX-файлов (5 на поставщика) → парсинг в браузере
+  → нормализация в общую структуру (lib/nexus/replenishment/assemble.ts)
+  → детерминированный расчёт (lib/nexus/replenishment/calculation.ts)
+  → таблица рекомендаций по поставщикам
+  → (опционально, по клику) LLM-обоснование через серверный API-роут
 ```
 
-1. **Detect** — the uploaded table is profiled and routed to one of four recognized data shapes (`TIME_SERIES`, `CROSS_SECTIONAL`, `EVENT_TRANSACTION`, `AMBIGUOUS_TABULAR`). Unrecognized shapes get a `NEEDS_INPUT`/`UNSUPPORTED` decision, not a forced result.
-2. **Investigate** — the Investigator agent picks one deterministic tool from the resolved tool pack (generic, or a domain-specific pack) and calls it. It never computes a number itself.
-3. **Evidence** — every tool call returns an `EvidenceRecord`: a tool name, the exact inputs, and the exact computed output. Evidence is never edited by the UI layer, only relabeled for display.
-4. **Challenge** — the Skeptic agent reviews the Investigator's hypothesis, can call its own deterministic tool, and returns `SUPPORTED` / `CHALLENGED` / `INCONCLUSIVE` plus alternative explanations.
-5. **Validate** — a separate deterministic validator recomputes the entire artifact from the raw rows and hashes it. If the recomputation does not match, the run is not `VALIDATED` and no export is offered.
-6. **Act** — only a `VALIDATED` artifact can produce a controlled export (a CSV/JSON decision package for a human operator). NEXUS never executes a financial, scheduling, or operational intervention itself.
+**Весь расчёт выполняется в браузере пользователя** — файлы не отправляются ни на какой сервер, парсинг и вычисления идут локально в JavaScript. Единственный сетевой запрос — опциональный вызов `/api/replenishment/narrate`, и только когда пользователь явно нажимает кнопку «Получить объяснение от ИИ» по конкретной строке; это осознанное архитектурное решение: секретный `OPENAI_API_KEY` не может присутствовать в клиентском коде, поэтому эта единственная функция реализована как серверный маршрут, а не как прямой вызов из браузера.
 
-Causality is always reported as `NOT_ESTABLISHED`. See [§9](#9-evidence-and-validation).
-
-## 6. What the prototype currently demonstrates
-
-NEXUS ships as a **domain-agnostic core**: upload any tabular dataset and it is profiled, routed to one of four recognized data shapes, and investigated through the generic deterministic tool pack (six tools: `profile_dataset`, `inspect_series`, `calculate_correlation`, `detect_outliers`, `inspect_missingness`, `inspect_directional_movement`) — no domain-specific code path is required for an ordinary investigation to run end to end.
-
-The Domain Registry (`lib/nexus/domains/`) additionally ships four registered metric vocabularies — `RETAIL`, `LOGISTICS`, `MANUFACTURING`, `MINING` — proving the registry mechanism itself (column-alias resolution, detection scoring) works across genuinely different domains, purely from declarative metadata; none of them has a specialized deterministic tool pack or a prepared Command Center scenario today. Adding one, for a new domain identified by an actual task brief, follows the pattern in [§21](#21-hackathon-adaptation-model).
-
-## 7. Agentic investigation
-
-```text
-Investigator → deterministic tool → Evidence → Skeptic → validated result
+Формула пополнения:
+```
+target_position = очищенный_спрос × сезонность × рост × (срок_поставки + период_пересмотра) + страховой_запас
+current_position = max(0, остаток − резерв) + товар_в_пути_в_горизонте
+рекомендуемый_заказ = max(0, target_position − current_position), округлено до кратности MOQ
 ```
 
-Two live LLM roles (`gpt-5-mini` by default, `OPENAI_MODEL` overridable), each constrained to a fixed JSON-schema action space and a small tool catalog:
+## 4. Технологии и архитектура
 
-- **Investigator** — chooses one tool from the resolved pack, forms a primary hypothesis and one alternative explanation, cites only Evidence IDs that actually exist.
-- **Skeptic** — reviews the hypothesis, may run one more tool, returns a verdict and its own alternatives.
+- **Стек**: Next.js 15 / React 19 / TypeScript, без внешних UI-библиотек.
+- **Парсинг XLSX**: библиотека `xlsx`, весь разбор — в браузере (`lib/nexus/replenishment/xlsxParsers.ts`).
+- **Расчёт**: чистые детерминированные функции без побочных эффектов (`lib/nexus/replenishment/calculation.ts`), 0 зависимостей от LLM — воспроизводимо и тестируемо байт в байт.
+- **LLM-обоснование (опционально)**: OpenAI Responses API (`gpt-5-mini` по умолчанию, `OPENAI_MODEL` переопределяемо), серверный маршрут `app/api/replenishment/narrate`, со строгой JSON-схемой ответа и явным fallback (никогда не 500-я ошибка) при отсутствии ключа/таймауте/некорректном ответе модели.
+- **Границы клиент/сервер**: `components/replenishment/ReplenishmentWorkspace.tsx` — весь клиентский код (парсинг, расчёт, UI); `app/api/replenishment/narrate/route.ts` + `lib/nexus/replenishment/narration.ts` — единственное место, где на сервере используется API-ключ.
 
-Without `OPENAI_API_KEY`, or if a call times out or fails validation, NEXUS falls back to a bounded, clearly-labeled deterministic fallback path — it never blocks the investigation on an LLM being available.
+Этот кейс построен поверх переиспользуемой инфраструктуры (харнесс) — что именно унаследовано и что написано заново для этого кейса, см. раздел «Disclosure» ниже и приложение в конце файла.
 
-## 8. Reasoning vs Computation
+## 5. Установка и запуск
 
-This is the one invariant every other design choice in NEXUS defers to:
-
-| | Decides | Never does |
-|---|---|---|
-| **LLM / Agents** (Investigator, Skeptic) | which tool to call, how to phrase a hypothesis/challenge, which alternative to raise | compute a statistic, invent a number, assert proven causality |
-| **Deterministic code** (`lib/engine`, `lib/nexus/agentic/precursorChain.ts`, tool packs) | every correlation, lag, p-value, confidence interval, bootstrap result, validation hash, action eligibility | interpret meaning, choose what to investigate |
-
-A validator never trusts an agent's stated number — it recomputes the whole artifact from the raw dataset and compares hashes.
-
-## 9. Evidence and validation
-
-- **Evidence** (`EvidenceRecord`): `{ id, tool, variables, result, data }` — produced only by a deterministic tool execution, never edited afterward. Display code (`lib/nexus/report/displayLabels.ts`) may relabel the *text shown to a user*, but never the stored record.
-- **Precursor chain**: for each candidate signal, correlation against the mapped target is scanned across lags 0–3 (`lib/nexus/agentic/precursorChain.ts`), keeping every tested lag, Holm-correcting significance across that scan, and computing a Fisher-z confidence interval and a moving-block bootstrap stability label. Causality is always reported `NOT_ESTABLISHED` — a lagged, significant correlation is co-movement with a lead time, not a proven mechanism.
-- **Validation**: `validateTimeSeriesArtifact` (and the Cross-Sectional/Event equivalents) independently recompute the artifact from the raw dataset and diff it against the one produced during the run. Only a `VALIDATED` result can reach the Action layer.
-
-Full statistical detail: [docs/methodology.md](docs/methodology.md).
-
-## 10. Action model
-
-`runExportDecisionAction` (`lib/nexus/action/exportDecision.ts`) is domain-agnostic and gates on a `VALIDATED` artifact:
-
-```text
-PROPOSED → POLICY_APPROVED → EXECUTED → VERIFIED
-```
-
-The only action NEXUS ever performs is producing a downloadable, re-verifiable export (a CSV of leading signals/flagged rows plus a JSON decision record) for a human operator to review. It never executes a financial, scheduling, or policy change itself — every result screen says so explicitly.
-
-## 11. Architecture
-
-```text
-Upload/Prepared dataset
-  → Universal admission (data-shape router: TIME_SERIES / CROSS_SECTIONAL / EVENT_TRANSACTION / AMBIGUOUS_TABULAR)
-  → Task Registry + Domain Registry (declarative runtime-capability resolution)
-  → Tool pack (generic, or a domain-specific deterministic pack)
-  → Agent runtime (Investigator → Skeptic)
-  → Deterministic validator (recompute-and-diff)
-  → Action layer (controlled export)
-```
-
-TIME_SERIES and the Cross-Sectional/Event-Transaction workflows use separate, hardened agent runtimes within the current upload pipeline. Domain dispatch for TIME_SERIES is declarative (`resolveRuntimeToolPackScenario` in `lib/nexus/tasks/taskRegistry.ts`) — adding a domain without a dedicated tool pack needs no API-route or agent-runtime changes.
-
-One consequence of the split worth recording rather than rediscovering: TIME_SERIES's generic tool pack has a `"pair"` argument kind (`{left, right}`, e.g. `calculate_correlation`) whose two fields are independent `strict:true` JSON-schema enums — nothing stops the model picking the same column for both, which is why `liveInvestigator.ts`/`liveSkeptic.ts` carry a bounded one-shot argument-repair step for exactly that collision. The bounded runtime's `BoundedToolArgumentKind` (`lib/nexus/agentic/boundedRuntime/runtime.ts`) is typed as `"none" | "id"` only — no CROSS_SECTIONAL/EVENT_TRANSACTION tool has ever taken a two-column pair argument, so this specific failure mode cannot occur there by construction, not just by current tool choices. The bounded runtime's own gap is different: any schema/argument/evidence failure there falls straight to the deterministic fallback with no repair attempt at all — always safe, just more fallback-prone than the repaired TIME_SERIES path.
-
-## 12. Domain Registry and Domain Packs
-
-`lib/nexus/domains/` holds one file per domain: canonical metric definitions (id, Russian label, unit, risk direction, aliases), detection thresholds, and (optionally) causal priors and a scenario config.
-
-Registered today: `RETAIL`, `LOGISTICS`, `MANUFACTURING`, `MINING` — vocabulary/detection metadata only, no deterministic tool pack, no scenario; they demonstrate registry breadth, not prepared demo verticals. `LOGISTICS` is the domain relevant to this hackathon's actual case (see Status/Disclosure at the top) — but the case's reorder calculation is a **new, separate deterministic module** (`lib/nexus/replenishment/`), not a Registry-driven investigation tool pack; the case's shape (compute a recommended order quantity) doesn't fit the Investigator/Skeptic-style investigation this Registry mechanism was built to serve.
-
-Runtime capability resolution (`resolveRuntimeToolPackScenario`) is a pure function: an explicit task wins outright; otherwise an ordinary upload's resolved domain may link to a registered task's tool pack; an unregistered or tool-pack-less domain always falls back to the generic engine. No domain name ever appears as a branch inside the generic agents or the API route.
-
-## 13. Practical applications
-
-- **Where**: any organization with a recurring tabular risk metric and no dedicated data-science team to chase every anomaly by hand.
-- **By whom**: a risk/ops analyst, PM, or department head who needs a first-pass investigation before escalating.
-- **What it supports**: descriptive investigation, hypothesis formation and challenge, a validated evidence package, and a controlled export for a human decision.
-- **What it does not automate**: it does not decide policy, does not execute a financial/operational action, and does not claim proven causality. Every export exists to be reviewed by a person, not to trigger anything automatically.
-
-**This hackathon's concrete application** is narrower and not risk-investigation-shaped at all: a
-purchasing manager gets a recommended supplier-order quantity per SKU, with an explainable justification,
-instead of a manual Excel calculation — see Status/Disclosure at the top.
-
-## 14. Development potential
-
-The current build intentionally proves breadth (Domain Registry, generic runtime) without building out any specific vertical, so the next domain is added to fit an actual task rather than retrofitted around a pre-built demo. **This is happening live right now for `LOGISTICS`** — not hypothetically — see Status/Disclosure at the top for the actual case and progress checklist.
-
-- **A scenario/intervention panel or specialized tool pack for a registered domain** — `RETAIL`/`LOGISTICS`/`MANUFACTURING`/`MINING` already have canonical metric vocabularies; `lib/nexus/templates/domainToolPack.template.ts` is a ready starting shape for a new tool pack.
-- **Specialized deterministic tool packs** for a new domain, only where the generic six tools genuinely cannot express the needed calculation.
-- **Additional data shapes / task modes** — `OPTIMIZE`/`MATCH`/`ANALYZE` are declared as `TaskMode` values today but have no agent behavior yet; `INVESTIGATE` is the only implemented mode.
-- **Human Challenge / re-investigation loop, persistent investigation history, additional export integrations, optimization/allocation engines** — none of these exist yet; they are future directions, not implemented features.
-- **Fast adaptation to a new hackathon task** — see [§21](#21-hackathon-adaptation-model) and [docs/task-adaptation-harness.md](docs/task-adaptation-harness.md).
-
-## 15. Limitations
-
-- Causality is never established — every lagged association is reported as an observed, statistically-scanned co-movement, explicitly not a proven mechanism.
-- `OPTIMIZE`/`MATCH`/`ANALYZE` task modes are declared but not implemented; only `INVESTIGATE` runs today.
-- No domain currently has a specialized deterministic tool pack or a prepared Command Center demo scenario — every investigation today runs on the generic six-tool pack.
-- No persistence layer: every investigation exists only for the browser session that ran it.
-- Production-ready code hardening (rate limiting, auth, multi-tenant isolation) is out of scope for this prototype.
-
-## 16. Demo
-
-See [DEMO.md](DEMO.md) for the jury walkthrough script and the no-network fallback behavior.
-
-## 17. Run locally
-
-Requires Node.js (developed and tested on Node 24).
+Требуется Node.js (проверено на Node 24).
 
 ```bash
 npm install
 npm run dev
 ```
 
-Open `http://localhost:3000`, then upload any tabular dataset (CSV/XLSX) via the ordinary upload flow at `/investigate` — there is no prepared demo case today; see [§21](#21-hackathon-adaptation-model) for adding one.
+Открыть `http://localhost:3000/replenishment`.
 
-Production build:
-
+Продакшен-сборка (именно так собирается деплой на Vercel):
 ```bash
 npm run build
 npm run start
 ```
 
-## 18. Environment variables
+## 6. Как проверить сценарий
 
-Optional — see [`.env.example`](.env.example). Without `OPENAI_API_KEY`, NEXUS runs entirely on its deterministic fallback path (still fully explorable, just without live LLM phrasing).
+1. Открыть `/replenishment` (локально или на живом деплое выше).
+2. Для каждого из двух поставщиков загрузить соответствующие 5 файлов из `demo/data/replenishment/iek/` и `demo/data/replenishment/systeme-electric/` в поля с такими подписями: «Динамика продаж» → `sales_transactions.xlsx`, «Продажи по месяцам» → `monthly_sales.xlsx`, «Остатки по месяцам» → `monthly_stock.xlsx`, «Товар в пути» → `inbound_shipments.xlsx` (у IEK) / `inbound_dashboard.xlsx` (у Systeme Electric), «MOQ / кратность» → `moq.xlsx`.
+3. Нажать «Рассчитать заказы →».
+4. Появится таблица по каждому поставщику: артикул, рекомендуемое количество, срочность, покрытие в месяцах. Раскрыть «Показать расчёт» у любой строки — видно полное числовое обоснование.
+5. (Опционально, требует `OPENAI_API_KEY`) Нажать «Получить объяснение от ИИ» в раскрытой строке — появится текстовое обоснование на русском.
+
+Это реальные данные партнёра (не синтетика) — с ними легко напрямую проверить каждый из 5 обязательных критериев (см. раздел 2).
+
+## 7. Данные и интеграции
+
+- **Данные**: реальные выгрузки партнёра (ТОО «Электрокомплект») по двум поставщикам — IEK и Systeme Electric, включены в репозиторий в `demo/data/replenishment/` (это официальные материалы кейса, не синтетика; персональных данных клиентов в них нет — история продаж не содержит поля с идентификатором клиента вообще).
+- **Внешние сервисы**: OpenAI Responses API — опционально, только для текстового обоснования; сам расчёт не зависит от него ни в каком виде.
+
+## 8. Известные ограничения
+
+Честно, без приукрашивания:
+
+- **Нет поля «клиент» в истории продаж** — вопреки исходному ТЗ, в реальных данных партнёра такого поля нет вообще. Детекция разовых крупных заказов работает по аномальному размеру отдельной транзакции, а не по привязке к конкретному клиенту.
+- **Нет явного индикатора дефицита (stockout)** — ни в одном исходном файле такой отметки нет. Период дефицита выводится эвристически: месяц с остатком около нуля при ненулевом спросе в соседних месяцах.
+- **Нет источника срока поставки по SKU/поставщику** в предоставленных файлах — используется явно документированная дефолтная константа (`lib/nexus/replenishment/assemble.ts`), задаваемая параметром, а не встроенная в расчёт.
+- **Резервы под клиентов и категория товара** есть только у Systeme Electric (в файле «Товар в пути») — у IEK такого источника нет, резерв по умолчанию 0, категория — `UNCLASSIFIED` с нейтральным уровнем сервиса 95%.
+- **Внешний прогноз прироста спроса** («прогноз по приросту» из ТЗ) не имеет отдельного источника данных от партнёра — по умолчанию 0 (полагаемся только на историческую сезонность и тренд), параметр настраиваемый.
+- **Бюджет закупки и загрузка транспорта** — не реализованы (не входили в обязательные требования кейса; в требованиях упоминались только MOQ/условия поставщика, что реализовано).
+- **LLM-обоснование** — опциональное улучшение поверх уже вычисленного результата; при недоступности модели интерфейс молча остаётся на детерминированном тексте, который уже полностью удовлетворяет требованию «каждая строка сопровождается обоснованием» сам по себе.
+
+## 9. Disclosure: что подготовлено до соревновательной части
+
+Согласно Положению §6.4 (обязательное раскрытие использования ранее созданного кода) — этот проект построен поверх переиспользуемой, доменно-нейтральной инфраструктуры («харнесс»), подготовленной командой заранее с помощью Claude Code (AI-агент для разработки; разрешено согласно §6.9):
+
+- Next.js-каркас приложения и конфигурация деплоя.
+- Слой приёма данных: разбор CSV/XLSX (устойчивый к кавычкам, многолистовой, с учётом русских форматов дат, разделителей тысяч и локализованных заголовков) — общие утилиты, на которых также построен новый парсер XLSX-книг Электрокомплекта.
+- Агентный паттерн (LLM выбирает/формулирует, никогда не вычисляет) и транспортный слой вызова LLM с таймаутами/ретраями/аудитом (`lib/nexus/agentic/llmRequest.ts`) — переиспользован для опционального LLM-обоснования в этом кейсе.
+- Универсальный статистический движок и Domain Registry — не используются напрямую в расчёте этого кейса (задача не инвестигационная, а расчётная), но их код остаётся в репозитории как часть заявленного харнесса.
+
+**Никакой доменной бизнес-логики, датасета или решённого кейса в этой базе не было.** Всё, что относится непосредственно к решению — парсинг реальных книг Электрокомплекта, нормализация данных, формула пополнения, сезонность, компенсация дефицита, исключение всплесков, страховой запас от волатильности, учёт резервов, страница `/replenishment`, LLM-обоснование — построено во время соревновательной части. Коммиты в этом репозитории с официального старта отражают эту работу.
+
+## 10. Команда
+
+Один участник.
+
+---
+
+## Приложение: базовый харнесс (подготовлен заранее, раскрыт выше)
+
+Ниже — краткое описание переиспользуемой инфраструктуры, на которой построен этот кейс. Она была спроектирована как доменно-нейтральный движок для расследования аномалий (LLM Investigator/Skeptic поверх детерминированной статистики) — терминология «risk investigation» ниже относится именно к этому базовому слою, а не к текущему кейсу пополнения склада, который является отдельным детерминированным расчётным модулем.
+
+- **Назначение движка**: загруженный табличный датасет профилируется, маршрутизируется по форме данных (`TIME_SERIES`/`CROSS_SECTIONAL`/`EVENT_TRANSACTION`/`AMBIGUOUS_TABULAR`), и по нему проводится ограниченное объяснимое расследование: LLM-Investigator выбирает, какой детерминированный инструмент запустить, каждый вызов возвращает `EvidenceRecord`, LLM-Skeptic оспаривает гипотезу, отдельный валидатор независимо пересчитывает весь артефакт из сырых данных и сверяет хэш. Причинность никогда не устанавливается — только заявляется как гипотеза.
+- **Инвариант**: LLM решает, что проверить и как сформулировать вывод; детерминированный код считает каждое число. Валидатор никогда не доверяет заявленному агентом числу — только собственному пересчёту.
+- **Domain Registry** (`lib/nexus/domains/`) — словарные записи (без бизнес-логики) для `RETAIL`, `LOGISTICS`, `MANUFACTURING`, `MINING`.
+- **Живой маршрут расследования**: `/investigate` — доступен в этом репозитории как часть заявленного харнесса, но не является решением текущего кейса.
+
+Полная документация базового харнесса: [docs/methodology.md](docs/methodology.md) (статистика), [docs/task-adaptation-harness.md](docs/task-adaptation-harness.md) (процедура адаптации под новую задачу).
+
+### Переменные окружения
 
 ```text
-OPENAI_API_KEY=      # optional; enables live Investigator/Skeptic reasoning
-OPENAI_MODEL=        # optional; defaults to gpt-5-mini
+OPENAI_API_KEY=      # опционально; включает LLM-обоснование в /replenishment и живой агентный цикл в /investigate
+OPENAI_MODEL=        # опционально; по умолчанию gpt-5-mini
 ```
 
-Never commit `.env.local`; it is already excluded via `.gitignore`.
+Без `OPENAI_API_KEY` приложение полностью работает — расчёт пополнения детерминирован и не зависит от LLM ни в каком виде; `/investigate` переходит на явно помеченный детерминированный fallback. `.env.local` никогда не коммитится (исключён через `.gitignore`).
 
-## 19. Tests / verification
+### Тесты и проверка
 
 ```bash
 npm test          # node --test lib/**/*.test.ts
@@ -232,47 +144,15 @@ npm run lint      # eslint .
 npm run build     # next build
 ```
 
-The test count is reported by the current `npm test` run.
-
-## 20. Repository structure
+### Структура репозитория
 
 ```text
-app/                       Next.js routes (/ and /investigate)
-components/nexus/          UI: Command Center, Investigation Workspace, Decision View
-lib/engine/                Domain-agnostic statistics (Pearson, inferential stats, bootstrap)
-lib/nexus/universal/       Data-shape admission/routing (TIME_SERIES/CROSS_SECTIONAL/EVENT_TRANSACTION/AMBIGUOUS_TABULAR)
-lib/nexus/domains/         Domain Registry: one file per domain (metrics, aliases, detection, scenario)
-lib/nexus/tasks/           Task Registry + runtime capability resolution + agent instructions
-lib/nexus/agentic/         Investigator/Skeptic runtime, tool pack interface, Evidence, precursor chain
-lib/nexus/templates/       Inert starting shape for a new domain's tool pack
-lib/nexus/crossSectional/  Cross-sectional workflow (bounded runtime)
-lib/nexus/eventTransaction/Event/transaction workflow (generic)
-lib/nexus/timeSeries/      Deterministic artifact + validator
-lib/nexus/action/          Domain-agnostic controlled export/action layer
-lib/nexus/report/          Presentation-only: display labels, view models, PDF report
-lib/nexus/demo/            Prepared demo datasets + scenario registry
-demo/data/                 Sample files
-docs/                      Methodology and hackathon-adaptation documentation
+app/replenishment/            Страница кейса: загрузка файлов, таблица рекомендаций
+app/investigate/              Живой маршрут базового харнесса (не относится к текущему кейсу)
+app/api/replenishment/narrate/ Серверный маршрут LLM-обоснования (единственное место с API-ключом)
+components/replenishment/     UI кейса
+lib/nexus/replenishment/      Парсинг, сборка входа, детерминированный расчёт, LLM-обоснование
+demo/data/replenishment/      Реальные данные партнёра (IEK, Systeme Electric) для воспроизводимости
+lib/engine/, lib/nexus/agentic/, lib/nexus/domains/, ...  Базовый харнесс (см. приложение выше)
+docs/                         Методология и документация адаптации харнесса
 ```
-
-## 21. Hackathon adaptation model
-
-This repository was designed as a **reference implementation** meant to adapt to whatever technical
-specification is announced on-site. **That adaptation is what's actually happening in this repository right
-now**, for the real announced case (HackAlem AI, Логистика — «Электрокомплект», automatic supplier-order
-replenishment; see Status/Disclosure at the top), not a hypothetical future one:
-
-```text
-Read the spec → decide if NEXUS fits → inspect the dataset → choose/adapt a Domain Pack
-→ resolve runtime capability → map schema → define the objective → run the pipeline
-→ add domain computation only if required → define a safe action → verify → rewrite presentation
-```
-
-For this specific case, the "spec fits NEXUS" answer was **partial**: the task is a deterministic
-replenishment calculation, not an investigation, so the Investigator/Skeptic pipeline above doesn't apply
-directly — what carries over is the ingestion layer, the outlier-detection primitive (repurposed to exclude
-one-off large orders from regular demand), the Evidence/never-fabricate discipline, and the
-narration/reporting pattern, wrapped around a new deterministic calculation module built for this case
-(`lib/nexus/replenishment/`).
-
-The full step-by-step procedure, a real file map with safe/unsafe change boundaries, a coding-agent prompt template, and a review checklist live in [docs/task-adaptation-harness.md](docs/task-adaptation-harness.md). A narrower, TIME_SERIES-specific quick reference is at [docs/task-adaptation-quickref.md](docs/task-adaptation-quickref.md).
