@@ -7,6 +7,7 @@ import {
   parseMonthlySales,
   parseMinimumOrderQuantities,
   parseSalesTransactions,
+  parseSkuCurrentStocks,
   parseSkuReservations,
 } from "./xlsxParsers.ts";
 
@@ -16,19 +17,23 @@ function workbookBytes(rows: unknown[][], sheetName = "Лист_1"): Uint8Array 
   return XLSX.write(workbook, { type: "buffer", bookType: "xlsx" });
 }
 
-test("transaction parser converts signed source quantities to positive unitsSold", () => {
+test("transaction parser normalizes both historical sign conventions and excludes non-sale documents", () => {
   const bytes = workbookBytes([
     ["Дата", "Номер", "Документ", "Код", "Номенклатура", "Ед.", "Склад", "Количество"],
     ["05.09.2026 14:30:00", "INV-1", "Продажа INV-1", "SKU-1", "Автомат", "шт", "Основной", -12],
     [new Date("2026-09-06T10:00:00Z"), "INV-2", "Продажа INV-2", "SKU-2", "Кабель", "м", "Основной", -3],
+    [new Date("2026-09-07T10:00:00Z"), "INV-3", "Расходная накладная INV-3", "SKU-3", "Реле", "шт", "Основной", 4],
+    [new Date("2026-09-08T10:00:00Z"), "INV-4", "Приходная накладная INV-4", "SKU-4", "Возврат", "шт", "Основной", 8],
   ]);
 
   const parsed = parseSalesTransactions(bytes);
-  assert.equal(parsed.length, 2);
+  assert.equal(parsed.length, 3);
   assert.equal(parsed[0].unitsSold, 12);
   assert.equal(parsed[0].sourceQuantity, -12);
   assert.equal(parsed[0].sku, "SKU-1");
   assert.match(parsed[0].occurredAt, /^2026-09-05T14:30:00/);
+  assert.equal(parsed[2].unitsSold, 4);
+  assert.equal(parsed[2].sourceQuantity, 4);
 });
 
 test("monthly sales parser understands two-level headers and normalizes blank/NaN cells to zero", () => {
@@ -112,5 +117,18 @@ test("reservation parser reads reserved customer stock and clamps negative value
   assert.deepEqual(parseSkuReservations(bytes), [
     { sku: "SKU-1", reservedStock: 7 },
     { sku: "SKU-2", reservedStock: 0 },
+  ]);
+});
+
+test("current-stock parser selects the exact dashboard stock column", () => {
+  const bytes = workbookBytes([
+    [null, null, null, null],
+    ["№", "Код 1с", "Наименование", "Остаток ТЗ", "Остаток", "Зарезервировано", "Свободный остаток"],
+    [1, "SKU-1", "Автомат", 99, 20, 7, 13],
+    [2, "SKU-2", "Кабель", 88, -4, 0, 0],
+  ]);
+  assert.deepEqual(parseSkuCurrentStocks(bytes), [
+    { sku: "SKU-1", currentStock: 20 },
+    { sku: "SKU-2", currentStock: 0 },
   ]);
 });

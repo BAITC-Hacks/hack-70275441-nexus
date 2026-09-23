@@ -11,6 +11,7 @@ const supplier = (name: string, sku: string, month: "2026-08" | "2026-09", categ
   salesTransactions: [{ sku, productName: sku, invoiceNumber: "I", occurredAt: `${month}-01T00:00:00Z`, unitsSold: 10, sourceQuantity: -10 }],
   minimumOrderQuantities: [{ sku, productName: sku, multiple: 4 }],
   reservations: name === "Systeme Electric" ? [{ sku, reservedStock: 2 }] : [],
+  currentStocks: name === "Systeme Electric" ? [{ sku, currentStock: 17 }] : [],
   ...(category ? { categories: [{ sku, category }] } : {}),
 });
 
@@ -22,6 +23,9 @@ test("assembly combines both suppliers and derives the freshest stock month", ()
   assert.equal(result.salesTransactions.length, 2);
   assert.equal(result.minimumOrderQuantities?.length, 2);
   assert.equal(result.reservations?.length, 1);
+  assert.equal(result.currentStocks?.length, 1);
+  assert.equal(result.monthlySales[0].supplier, "IEK");
+  assert.equal(result.monthlySales[1].supplier, "Systeme Electric");
   assert.equal(result.options.asOfMonth, "2026-09");
 });
 

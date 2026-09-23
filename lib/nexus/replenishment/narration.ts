@@ -8,12 +8,12 @@ export const REPLENISHMENT_NARRATOR_SYSTEM_PROMPT = `Ты пишешь крат�
 Объясни по-русски в 2–4 предложениях, почему рекомендовано указанное количество, связав спрос, сезонность и рост с доступным остатком, резервом, товаром в пути и страховым запасом.`;
 
 export type ReplenishmentNarrationInput = Pick<ReplenishmentRecommendation,
-  "sku" | "productName" | "supplier" | "category" | "baseMonthlyDemand" | "seasonalIndex" |
+  "sku" | "productName" | "supplier" | "category" | "baseMonthlyDemand" | "seasonalIndex" | "seasonalForecast" |
   "historicalGrowthRate" | "forecastGrowthRate" | "stockoutAdjustmentUnitsPerMonth" | "stockoutMonths" |
   "excludedSpikeCount" | "excludedSpikeUnits" | "retainedGrowthSpikeCount" | "retainedGrowthSpikeUnits" |
-  "spikeOrderImpactEstimate" | "currentStock" | "reservedStock" | "availableStock" |
+  "spikeOrderImpactEstimate" | "openingStockAsOf" | "salesSinceOpening" | "currentStock" | "currentStockSource" | "reservedStock" | "availableStock" |
   "goodsInTransitWithinHorizon" | "goodsInTransitUnknownEta" | "goodsInTransitAfterHorizon" |
-  "etaAssumptionApplied" | "demandStdDev" | "serviceLevel" | "safetyStockZScore" | "safetyStock" |
+  "etaAssumptionApplied" | "unknownEtaExcluded" | "demandStdDev" | "serviceLevel" | "safetyStockZScore" | "safetyStock" |
   "targetPosition" | "currentPosition" | "recommendedOrder" | "urgency" | "demandPattern" |
   "nonZeroDemandFrequency" | "forecastMethod" | "exceptions" | "planningMonthlyDemand" |
   "stockLifecycleStatus" | "daysOfSupply" | "isOverstock" | "overstockMonths" |
@@ -46,11 +46,11 @@ const fallback = (): ReplenishmentNarrationResult => ({ narrative: "", source: "
 export function isReplenishmentNarrationInput(value: unknown): value is ReplenishmentNarrationInput {
   if (!value || typeof value !== "object") return false;
   const item = value as Record<string, unknown>;
-  const strings = ["sku", "productName", "supplier", "category", "demandPattern", "forecastMethod", "stockLifecycleStatus"];
+  const strings = ["sku", "productName", "supplier", "category", "demandPattern", "forecastMethod", "stockLifecycleStatus", "currentStockSource"];
   const numbers = [
     "baseMonthlyDemand", "seasonalIndex", "historicalGrowthRate", "forecastGrowthRate",
     "stockoutAdjustmentUnitsPerMonth", "excludedSpikeCount", "excludedSpikeUnits", "retainedGrowthSpikeCount",
-    "retainedGrowthSpikeUnits", "spikeOrderImpactEstimate", "currentStock", "reservedStock", "availableStock",
+    "retainedGrowthSpikeUnits", "spikeOrderImpactEstimate", "openingStockAsOf", "salesSinceOpening", "currentStock", "reservedStock", "availableStock",
     "goodsInTransitWithinHorizon", "goodsInTransitUnknownEta", "goodsInTransitAfterHorizon", "demandStdDev", "serviceLevel",
     "safetyStockZScore", "safetyStock", "targetPosition", "currentPosition", "recommendedOrder", "nonZeroDemandFrequency",
     "planningMonthlyDemand", "overstockMonths",
@@ -59,7 +59,14 @@ export function isReplenishmentNarrationInput(value: unknown): value is Replenis
     && numbers.every((key) => typeof item[key] === "number" && Number.isFinite(item[key]))
     && Array.isArray(item.stockoutMonths) && item.stockoutMonths.every((month) => typeof month === "string")
     && typeof item.etaAssumptionApplied === "boolean"
+    && typeof item.unknownEtaExcluded === "boolean"
     && typeof item.isOverstock === "boolean"
+    && Array.isArray(item.seasonalForecast) && item.seasonalForecast.every((month) => {
+      if (!month || typeof month !== "object") return false;
+      const value = month as Record<string, unknown>;
+      return typeof value.month === "string" && typeof value.seasonalIndex === "number" && Number.isFinite(value.seasonalIndex)
+        && typeof value.weight === "number" && Number.isFinite(value.weight);
+    })
     && ["daysOfSupply", "potentialStockoutDays"].every((key) => item[key] === null || (typeof item[key] === "number" && Number.isFinite(item[key])))
     && ["nearestInboundExpectedDate", "projectedStockoutDate"].every((key) => item[key] === null || typeof item[key] === "string")
     && Array.isArray(item.exceptions) && item.exceptions.every((exception) => typeof exception === "string")

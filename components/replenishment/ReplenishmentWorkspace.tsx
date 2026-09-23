@@ -4,7 +4,7 @@ import { useMemo, useState } from "react";
 import { assembleReplenishmentInput, DEFAULT_ASSEMBLY_ASSUMPTIONS, type SupplierParsedData } from "@/lib/nexus/replenishment/assemble";
 import { calculateReplenishment, type ReplenishmentPlan, type ReplenishmentRecommendation } from "@/lib/nexus/replenishment/calculation";
 import type { ReplenishmentNarrationInput } from "@/lib/nexus/replenishment/narration";
-import { parseInboundShipments, parseMinimumOrderQuantities, parseMonthlyOpeningStock, parseMonthlySales, parseSalesTransactions, parseSkuCategories, parseSkuReservations } from "@/lib/nexus/replenishment/xlsxParsers";
+import { parseInboundShipments, parseMinimumOrderQuantities, parseMonthlyOpeningStock, parseMonthlySales, parseSalesTransactions, parseSkuCategories, parseSkuCurrentStocks, parseSkuReservations } from "@/lib/nexus/replenishment/xlsxParsers";
 import styles from "./replenishment.module.css";
 
 type FileKind = "transactions" | "monthlySales" | "openingStocks" | "inbound" | "moq";
@@ -12,6 +12,15 @@ type SupplierKey = "iek" | "systeme";
 type FilesState = Record<SupplierKey, Partial<Record<FileKind, File>>>;
 type ExceptionView = "all" | "urgent" | "anomaly" | "supply" | "surplus";
 type ManagerDecision = { quantity: number; status: "draft" | "confirmed" };
+type PlanningControls = {
+  leadTimeMonths: number;
+  reviewPeriodMonths: number;
+  forecastGrowthPercent: number;
+  serviceLevelA: number;
+  serviceLevelB: number;
+  serviceLevelC: number;
+  unclassifiedServiceLevel: number;
+};
 
 const FILE_FIELDS: Array<{ kind: FileKind; label: string; hint: string }> = [
   { kind: "transactions", label: "Динамика продаж", hint: "Транзакции и накладные" },
@@ -50,6 +59,9 @@ function validManagerQuantity(quantity: number, moq: number | null): number {
   return moq && safe > 0 ? Math.ceil(safe / moq) * moq : safe;
 }
 
+const serviceLevel = (percentValue: number): number => Math.min(99.5, Math.max(90, percentValue)) / 100;
+const csvCell = (value: string | number): string => `"${String(value).replaceAll('"', '""')}"`;
+
 async function parseSupplier(key: SupplierKey, files: Partial<Record<FileKind, File>>): Promise<SupplierParsedData> {
   for (const field of FILE_FIELDS) if (!files[field.kind]) throw new Error(`Не выбран файл «${field.label}» для ${key === "iek" ? "IEK" : "Systeme Electric"}.`);
   const read = async (kind: FileKind) => new Uint8Array(await files[kind]!.arrayBuffer());
@@ -63,32 +75,40 @@ async function parseSupplier(key: SupplierKey, files: Partial<Record<FileKind, F
     openingStocks: parseMonthlyOpeningStock(openingStocks),
     inboundShipments: parseInboundShipments(inbound),
     minimumOrderQuantities: parseMinimumOrderQuantities(moq),
-    ...(key === "systeme" ? { categories: parseSkuCategories(inbound), reservations: parseSkuReservations(inbound) } : { reservations: [] }),
+    ...(key === "systeme" ? {
+      categories: parseSkuCategories(inbound),
+      reservations: parseSkuReservations(inbound),
+      currentStocks: parseSkuCurrentStocks(inbound),
+    } : { reservations: [], currentStocks: [] }),
   };
 }
 
 function explanation(item: ReplenishmentRecommendation): string {
-  return `Тип спроса: ${demandPatternLabel[item.demandPattern]}, статус SKU: ${lifecycleLabel[item.stockLifecycleStatus]}, плановый спрос ${number.format(item.planningMonthlyDemand)} ед./мес. Базовый спрос ${number.format(item.baseMonthlyDemand)} ед./мес.; сезонность ×${number.format(item.seasonalIndex)}; исторический рост ${percent.format(item.historicalGrowthRate)}; внешний прогноз ${percent.format(item.forecastGrowthRate)}. Поправка stockout: +${number.format(item.stockoutAdjustmentUnitsPerMonth)} ед./мес. (${item.stockoutMonths.length} мес.); исключено всплесков: ${item.excludedSpikeCount} на ${number.format(item.excludedSpikeUnits)} ед., оценка влияния на заказ ${number.format(item.spikeOrderImpactEstimate)} ед.; сохранено повторных крупных продаж: ${item.retainedGrowthSpikeCount}. Страховой запас ${number.format(item.safetyStock)} = z ${number.format(item.safetyStockZScore)} × σ ${number.format(item.demandStdDev)} × √горизонта, уровень сервиса ${percent.format(item.serviceLevel)}. Позиция: остаток ${number.format(item.currentStock)} − резерв ${number.format(item.reservedStock)} + в пути ${number.format(item.goodsInTransitWithinHorizon)}; без точного ETA ${number.format(item.goodsInTransitUnknownEta)}, после горизонта ${number.format(item.goodsInTransitAfterHorizon)}; доступный остаток ${number.format(item.availableStock)}, целевой уровень ${number.format(item.targetPosition)}.`;
+  const seasonalPath = item.seasonalForecast.map((month) => `${month.month} ×${number.format(month.seasonalIndex)}`).join(", ");
+  const stockBasis = item.currentStockSource === "explicit_snapshot"
+    ? "фактический снимок"
+    : `оценка: начальный остаток ${number.format(item.openingStockAsOf)} − продажи ${number.format(item.salesSinceOpening)}`;
+  return `Тип спроса: ${demandPatternLabel[item.demandPattern]}, статус SKU: ${lifecycleLabel[item.stockLifecycleStatus]}, плановый спрос ${number.format(item.planningMonthlyDemand)} ед./мес. Базовый спрос ${number.format(item.baseMonthlyDemand)} ед./мес.; средняя сезонность будущего горизонта ×${number.format(item.seasonalIndex)} (${seasonalPath}); исторический рост ${percent.format(item.historicalGrowthRate)}; внешний прогноз ${percent.format(item.forecastGrowthRate)}. Поправка stockout: +${number.format(item.stockoutAdjustmentUnitsPerMonth)} ед./мес. (${item.stockoutMonths.length} мес.); исключено всплесков: ${item.excludedSpikeCount} на ${number.format(item.excludedSpikeUnits)} ед., оценка влияния на заказ ${number.format(item.spikeOrderImpactEstimate)} ед.; сохранено повторных крупных продаж: ${item.retainedGrowthSpikeCount}. Страховой запас ${number.format(item.safetyStock)} = z ${number.format(item.safetyStockZScore)} × σ ${number.format(item.demandStdDev)} × √горизонта, уровень сервиса ${percent.format(item.serviceLevel)}. Позиция: остаток ${number.format(item.currentStock)} (${stockBasis}) − резерв ${number.format(item.reservedStock)} + подтверждённо в пути ${number.format(item.goodsInTransitWithinHorizon)}; без точного ETA ${number.format(item.goodsInTransitUnknownEta)} не уменьшает заказ, после горизонта ${number.format(item.goodsInTransitAfterHorizon)}; доступный остаток ${number.format(item.availableStock)}, целевой уровень ${number.format(item.targetPosition)}.`;
 }
 
 function narrationInput(item: ReplenishmentRecommendation): ReplenishmentNarrationInput {
   const {
-    sku, productName, supplier, category, baseMonthlyDemand, seasonalIndex, historicalGrowthRate,
+    sku, productName, supplier, category, baseMonthlyDemand, seasonalIndex, seasonalForecast, historicalGrowthRate,
     forecastGrowthRate, stockoutAdjustmentUnitsPerMonth, stockoutMonths, excludedSpikeCount,
     excludedSpikeUnits, retainedGrowthSpikeCount, retainedGrowthSpikeUnits, spikeOrderImpactEstimate,
-    currentStock, reservedStock, availableStock, goodsInTransitWithinHorizon, goodsInTransitUnknownEta,
-    goodsInTransitAfterHorizon, etaAssumptionApplied, demandPattern, nonZeroDemandFrequency, forecastMethod, exceptions,
+    openingStockAsOf, salesSinceOpening, currentStock, currentStockSource, reservedStock, availableStock, goodsInTransitWithinHorizon, goodsInTransitUnknownEta,
+    goodsInTransitAfterHorizon, etaAssumptionApplied, unknownEtaExcluded, demandPattern, nonZeroDemandFrequency, forecastMethod, exceptions,
     planningMonthlyDemand, stockLifecycleStatus, daysOfSupply, isOverstock, overstockMonths,
     nearestInboundExpectedDate, projectedStockoutDate, potentialStockoutDays,
     demandStdDev, serviceLevel, safetyStockZScore, safetyStock, targetPosition, currentPosition,
     recommendedOrder, urgency,
   } = item;
   return {
-    sku, productName, supplier, category, baseMonthlyDemand, seasonalIndex, historicalGrowthRate,
+    sku, productName, supplier, category, baseMonthlyDemand, seasonalIndex, seasonalForecast, historicalGrowthRate,
     forecastGrowthRate, stockoutAdjustmentUnitsPerMonth, stockoutMonths, excludedSpikeCount,
     excludedSpikeUnits, retainedGrowthSpikeCount, retainedGrowthSpikeUnits, spikeOrderImpactEstimate,
-    currentStock, reservedStock, availableStock, goodsInTransitWithinHorizon, goodsInTransitUnknownEta,
-    goodsInTransitAfterHorizon, etaAssumptionApplied, demandPattern, nonZeroDemandFrequency, forecastMethod, exceptions,
+    openingStockAsOf, salesSinceOpening, currentStock, currentStockSource, reservedStock, availableStock, goodsInTransitWithinHorizon, goodsInTransitUnknownEta,
+    goodsInTransitAfterHorizon, etaAssumptionApplied, unknownEtaExcluded, demandPattern, nonZeroDemandFrequency, forecastMethod, exceptions,
     planningMonthlyDemand, stockLifecycleStatus, daysOfSupply, isOverstock, overstockMonths,
     nearestInboundExpectedDate, projectedStockoutDate, potentialStockoutDays,
     demandStdDev, serviceLevel, safetyStockZScore, safetyStock, targetPosition, currentPosition,
@@ -106,13 +126,39 @@ export function ReplenishmentWorkspace() {
   const [narrating, setNarrating] = useState<Record<string, boolean>>({});
   const [exceptionView, setExceptionView] = useState<ExceptionView>("all");
   const [decisions, setDecisions] = useState<Record<string, ManagerDecision>>({});
+  const [planning, setPlanning] = useState<PlanningControls>({
+    leadTimeMonths: DEFAULT_ASSEMBLY_ASSUMPTIONS.defaultLeadTimeMonths,
+    reviewPeriodMonths: DEFAULT_ASSEMBLY_ASSUMPTIONS.reviewPeriodMonths,
+    forecastGrowthPercent: DEFAULT_ASSEMBLY_ASSUMPTIONS.defaultForecastGrowthRate * 100,
+    serviceLevelA: 98,
+    serviceLevelB: 95,
+    serviceLevelC: 90,
+    unclassifiedServiceLevel: 95,
+  });
   const selectedCount = Object.values(files).flatMap((group) => Object.values(group)).length;
   const ready = selectedCount === FILE_FIELDS.length * SUPPLIERS.length;
 
   const visible = useMemo(() => plan?.suppliers.map((group) => ({
     ...group,
     items: group.items.filter((item) => matchesExceptionView(item, exceptionView) && `${item.sku} ${item.productName}`.toLocaleLowerCase("ru-RU").includes(query.toLocaleLowerCase("ru-RU"))).sort((a, b) => urgencyRank[a.urgency] - urgencyRank[b.urgency] || b.recommendedOrder - a.recommendedOrder),
-  })) ?? [], [plan, query, exceptionView]);
+  })).map((group) => ({ ...group, totalRecommendedUnits: group.items.reduce((sum, item) => sum + item.recommendedOrder, 0) })) ?? [], [plan, query, exceptionView]);
+  const confirmedRows = useMemo(() => plan?.suppliers.flatMap((group) => group.items.flatMap((item) => {
+    const decision = decisions[`${item.supplier}:${item.sku}`];
+    return decision?.status === "confirmed" ? [{ item, quantity: decision.quantity }] : [];
+  })) ?? [], [plan, decisions]);
+
+  const downloadConfirmedOrders = () => {
+    if (!confirmedRows.length) return;
+    const header = ["Поставщик", "SKU", "Наименование", "Рекомендация", "Подтверждено", "Срочность"];
+    const rows = confirmedRows.map(({ item, quantity }) => [item.supplier, item.sku, item.productName, item.recommendedOrder, quantity, item.urgency]);
+    const csv = `\uFEFF${[header, ...rows].map((row) => row.map(csvCell).join(";")).join("\r\n")}`;
+    const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `nexus-purchase-orders-${plan?.asOfMonth ?? "export"}.csv`;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
 
   const run = async () => {
     setRunning(true); setError(""); setPlan(undefined); setDecisions({}); setExceptionView("all");
@@ -120,7 +166,20 @@ export function ReplenishmentWorkspace() {
       // Yield once so the pending state paints before large partner workbooks are decoded.
       await new Promise((resolve) => setTimeout(resolve, 20));
       const parsed = await Promise.all(SUPPLIERS.map((supplier) => parseSupplier(supplier.key, files[supplier.key])));
-      setPlan(calculateReplenishment(assembleReplenishmentInput(parsed, DEFAULT_ASSEMBLY_ASSUMPTIONS)));
+      const assumptions = {
+        ...DEFAULT_ASSEMBLY_ASSUMPTIONS,
+        defaultLeadTimeMonths: Math.max(0.1, planning.leadTimeMonths),
+        reviewPeriodMonths: Math.max(0, planning.reviewPeriodMonths),
+        defaultForecastGrowthRate: Math.max(-99, planning.forecastGrowthPercent) / 100,
+        categoryServiceLevel: {
+          ...DEFAULT_ASSEMBLY_ASSUMPTIONS.categoryServiceLevel,
+          "1": serviceLevel(planning.serviceLevelA), A: serviceLevel(planning.serviceLevelA),
+          "2": serviceLevel(planning.serviceLevelB), B: serviceLevel(planning.serviceLevelB),
+          "3": serviceLevel(planning.serviceLevelC), "4": serviceLevel(planning.serviceLevelC), C: serviceLevel(planning.serviceLevelC),
+          UNCLASSIFIED: serviceLevel(planning.unclassifiedServiceLevel),
+        },
+      };
+      setPlan(calculateReplenishment(assembleReplenishmentInput(parsed, assumptions)));
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Не удалось обработать XLSX-файлы.");
     } finally { setRunning(false); }
@@ -175,12 +234,22 @@ export function ReplenishmentWorkspace() {
           </label>;
         })}</div>
       </article>)}</div>
+      <fieldset className={styles.planningControls}>
+        <legend>Плановые допущения</legend>
+        <label><span>Срок поставки, мес.</span><input type="number" min="0.1" step="0.1" value={planning.leadTimeMonths} onChange={(event) => setPlanning((current) => ({ ...current, leadTimeMonths: Number(event.target.value) }))} /></label>
+        <label><span>Период пересмотра, мес.</span><input type="number" min="0" step="0.1" value={planning.reviewPeriodMonths} onChange={(event) => setPlanning((current) => ({ ...current, reviewPeriodMonths: Number(event.target.value) }))} /></label>
+        <label><span>Внешний прогноз, %</span><input type="number" min="-99" step="1" value={planning.forecastGrowthPercent} onChange={(event) => setPlanning((current) => ({ ...current, forecastGrowthPercent: Number(event.target.value) }))} /></label>
+        <label><span>Сервис A / кат. 1, %</span><input type="number" min="90" max="99.5" step="0.1" value={planning.serviceLevelA} onChange={(event) => setPlanning((current) => ({ ...current, serviceLevelA: Number(event.target.value) }))} /></label>
+        <label><span>Сервис B / кат. 2, %</span><input type="number" min="90" max="99.5" step="0.1" value={planning.serviceLevelB} onChange={(event) => setPlanning((current) => ({ ...current, serviceLevelB: Number(event.target.value) }))} /></label>
+        <label><span>Сервис C / кат. 3–4, %</span><input type="number" min="90" max="99.5" step="0.1" value={planning.serviceLevelC} onChange={(event) => setPlanning((current) => ({ ...current, serviceLevelC: Number(event.target.value) }))} /></label>
+        <label><span>Сервис IEK без категории, %</span><input type="number" min="90" max="99.5" step="0.1" value={planning.unclassifiedServiceLevel} onChange={(event) => setPlanning((current) => ({ ...current, unclassifiedServiceLevel: Number(event.target.value) }))} /></label>
+      </fieldset>
       <div className={styles.runbar}><div><span>Все вычисления выполняются локально в браузере</span><small>Файлы не отправляются во внешние сервисы</small></div><button disabled={!ready || running} onClick={run}>{running ? "ОБРАБОТКА…" : "РАССЧИТАТЬ ЗАКАЗЫ →"}</button></div>
       {error && <p className={styles.error} role="alert">{error}</p>}
     </section>}
 
     {plan && <section className={styles.results}>
-      <div className={styles.sectionHead}><span>02</span><div><p>Результат на {plan.asOfMonth}</p><h2>Рекомендации по поставщикам</h2></div><button className={styles.reset} onClick={() => setPlan(undefined)}>Новый расчёт</button></div>
+      <div className={styles.sectionHead}><span>02</span><div><p>Результат на {plan.asOfMonth}</p><h2>Рекомендации по поставщикам</h2></div><div className={styles.resultActions}><button className={styles.exportButton} disabled={!confirmedRows.length} onClick={downloadConfirmedOrders}>Скачать PO CSV ({confirmedRows.length})</button><button className={styles.reset} onClick={() => setPlan(undefined)}>Новый расчёт</button></div></div>
       <div className={styles.summary}>
         <div><small>ПОЗИЦИЙ</small><b>{plan.suppliers.reduce((sum, group) => sum + group.items.length, 0)}</b></div>
         <div><small>К ЗАКАЗУ</small><b>{number.format(plan.suppliers.reduce((sum, group) => sum + group.totalRecommendedUnits, 0))}</b></div>
@@ -197,7 +266,7 @@ export function ReplenishmentWorkspace() {
           {group.items.map((item) => {
             const narrativeKey = `${item.supplier}:${item.sku}`;
             const decision = decisions[narrativeKey] ?? { quantity: item.recommendedOrder, status: "draft" as const };
-            return <tr key={item.sku}><td><b>{item.sku}</b><small>{item.productName}</small><span className={styles.pattern}>{demandPatternLabel[item.demandPattern]}</span>{item.stockLifecycleStatus !== "active" && <span className={`${styles.pattern} ${styles.lifecycleWarning}`}>{lifecycleLabel[item.stockLifecycleStatus]}</span>}</td><td className={styles.qty}>{number.format(item.recommendedOrder)}<small>MOQ {item.moqMultiple ?? "—"}</small>{item.stockLifecycleStatus === "dead" && <small className={styles.doNotOrder}>Не заказывать: спрос прекратился</small>}{item.isOverstock && item.recommendedOrder === 0 && <small className={styles.doNotOrder}>Не заказывать: запас превышает горизонт на {number.format(item.overstockMonths)} мес.</small>}{decision.status === "confirmed" && <small className={styles.confirmed}>Подтверждено: {number.format(decision.quantity)}</small>}</td><td><span className={`${styles.urgency} ${styles[item.urgency]}`}>{urgencyLabel[item.urgency]}</span></td><td><b>{item.daysOfSupply === null ? "—" : `${Math.round(item.daysOfSupply)} дн.`}</b><small>{item.daysOfSupply === null ? "Нет текущего спроса" : `товара хватит до ${item.projectedStockoutDate ?? "—"}`}</small></td><td><details><summary>Показать расчёт</summary><p>{explanation(item)}</p>{item.potentialStockoutDays !== null && item.potentialStockoutDays > 0 && <p className={styles.stockoutRisk}>Остаток закончится {item.projectedStockoutDate}, ближайшая поставка ожидается {item.nearestInboundExpectedDate}: {item.potentialStockoutDays} дн. потенциального дефицита.</p>}{item.isOverstock && <p className={styles.overstockNote}>{item.recommendedOrder === 0 ? `Автозаказ не требуется: совокупная позиция покрывает ${number.format(item.coverageMonths ?? 0)} мес. спроса.` : `Остаток покрывает ${number.format(item.coverageMonths ?? 0)} мес. спроса — выше обычного горизонта, но небольшой заказ всё ещё рекомендован из-за страхового запаса по волатильности этого SKU.`}</p>}{item.stockLifecycleStatus === "slow" && <p className={styles.assumption}>Slow stock: планирование переведено на средний спрос последних трёх доступных месяцев.</p>}{item.stockLifecycleStatus === "dead" && <p className={styles.stockoutRisk}>Dead stock: автоматическое пополнение заблокировано, рекомендация равна нулю.</p>}{item.etaAssumptionApplied && <p className={styles.assumption}>Допущение: поставка без ETA включена в горизонт. Менеджеру следует подтвердить дату.</p>}{narratives[narrativeKey] && <div className={styles.aiNarrative}><small>ОБЪЯСНЕНИЕ ИИ</small><p>{narratives[narrativeKey]}</p></div>}<div className={styles.decisionPanel}><label><small>КОЛИЧЕСТВО МЕНЕДЖЕРА</small><input type="number" min="0" step={item.moqMultiple ?? 1} value={decision.quantity} onChange={(event) => setDecisions((current) => ({ ...current, [narrativeKey]: { quantity: Math.max(0, Number(event.target.value) || 0), status: "draft" } }))} /></label><button onClick={() => setDecisions((current) => ({ ...current, [narrativeKey]: { quantity: validManagerQuantity(decision.quantity, item.moqMultiple), status: "confirmed" } }))}>Подтвердить</button></div><button className={styles.aiButton} disabled={narrating[narrativeKey]} onClick={() => requestNarrative(item)}>{narrating[narrativeKey] ? "ИИ формирует объяснение…" : "Получить объяснение от ИИ"}</button></details></td></tr>;
+            return <tr key={item.sku}><td><b>{item.sku}</b><small>{item.productName}</small><span className={styles.pattern}>{demandPatternLabel[item.demandPattern]}</span>{item.stockLifecycleStatus !== "active" && <span className={`${styles.pattern} ${styles.lifecycleWarning}`}>{lifecycleLabel[item.stockLifecycleStatus]}</span>}</td><td className={styles.qty}>{number.format(item.recommendedOrder)}<small>MOQ {item.moqMultiple ?? "—"}</small>{item.stockLifecycleStatus === "dead" && <small className={styles.doNotOrder}>Не заказывать: спрос прекратился</small>}{item.isOverstock && item.recommendedOrder === 0 && <small className={styles.doNotOrder}>Не заказывать: запас превышает горизонт на {number.format(item.overstockMonths)} мес.</small>}{decision.status === "confirmed" && <small className={styles.confirmed}>Подтверждено: {number.format(decision.quantity)}</small>}</td><td><span className={`${styles.urgency} ${styles[item.urgency]}`}>{urgencyLabel[item.urgency]}</span></td><td><b>{item.daysOfSupply === null ? "—" : `${Math.round(item.daysOfSupply)} дн.`}</b><small>{item.daysOfSupply === null ? "Нет текущего спроса" : `товара хватит до ${item.projectedStockoutDate ?? "—"}`}</small></td><td><details><summary>Показать расчёт</summary><p>{explanation(item)}</p>{item.potentialStockoutDays !== null && item.potentialStockoutDays > 0 && <p className={styles.stockoutRisk}>Остаток закончится {item.projectedStockoutDate}, ближайшая поставка ожидается {item.nearestInboundExpectedDate}: {item.potentialStockoutDays} дн. потенциального дефицита.</p>}{item.isOverstock && <p className={styles.overstockNote}>{item.recommendedOrder === 0 ? `Автозаказ не требуется: совокупная позиция покрывает ${number.format(item.coverageMonths ?? 0)} мес. спроса.` : `Остаток покрывает ${number.format(item.coverageMonths ?? 0)} мес. спроса — выше обычного горизонта, но небольшой заказ всё ещё рекомендован из-за страхового запаса по волатильности этого SKU.`}</p>}{item.stockLifecycleStatus === "slow" && <p className={styles.assumption}>Slow stock: планирование переведено на средний спрос последних трёх доступных месяцев.</p>}{item.stockLifecycleStatus === "dead" && <p className={styles.stockoutRisk}>Dead stock: автоматическое пополнение заблокировано, рекомендация равна нулю.</p>}{item.unknownEtaExcluded && <p className={styles.assumption}>Поставка без точного ETA не уменьшает заказ. После подтверждения даты менеджер может пересчитать план.</p>}{narratives[narrativeKey] && <div className={styles.aiNarrative}><small>ОБЪЯСНЕНИЕ ИИ</small><p>{narratives[narrativeKey]}</p></div>}<div className={styles.decisionPanel}><label><small>КОЛИЧЕСТВО МЕНЕДЖЕРА</small><input type="number" min="0" step={item.moqMultiple ?? 1} value={decision.quantity} onChange={(event) => setDecisions((current) => ({ ...current, [narrativeKey]: { quantity: Math.max(0, Number(event.target.value) || 0), status: "draft" } }))} /></label><button onClick={() => setDecisions((current) => ({ ...current, [narrativeKey]: { quantity: validManagerQuantity(decision.quantity, item.moqMultiple), status: "confirmed" } }))}>Подтвердить</button></div><button className={styles.aiButton} disabled={narrating[narrativeKey]} onClick={() => requestNarrative(item)}>{narrating[narrativeKey] ? "ИИ формирует объяснение…" : "Получить объяснение от ИИ"}</button></details></td></tr>;
           })}
         </tbody></table></div>
       </article>)}

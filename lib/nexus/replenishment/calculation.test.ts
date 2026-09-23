@@ -18,6 +18,7 @@ function baseInput(): ReplenishmentInput {
     inboundShipments: [],
     salesTransactions: [10, 10, 9, 11, 10].map((value, index) => transaction(value, index)),
     skuConfigs: [{ sku: "SKU-1", supplier: "Supplier A", category: "A", forecastGrowthRate: 0 }],
+    currentStocks: [{ sku: "SKU-1", currentStock: 20 }],
     minimumOrderQuantities: [],
     options: {
       asOfMonth: "2025-12",
@@ -41,14 +42,14 @@ test("criterion 1 — changing sales history changes the recommendation", () => 
 test("criterion 1 — changing current stock changes the recommendation", () => {
   const baseline = baseInput();
   const changed = baseInput();
-  changed.openingStocks = stocks([20, 20, 20, 20, 20, 80]);
+  changed.currentStocks = [{ sku: "SKU-1", currentStock: 80 }];
   assert.ok(first(changed).recommendedOrder < first(baseline).recommendedOrder);
 });
 
 test("criterion 1 — changing goods in transit changes the recommendation", () => {
   const baseline = baseInput();
   const changed = baseInput();
-  changed.inboundShipments = [{ sku: "SKU-1", productName: "SKU-1", shipmentId: "SHIP-1", expectedDate: null, quantity: 70 }];
+  changed.inboundShipments = [{ sku: "SKU-1", productName: "SKU-1", shipmentId: "SHIP-1", expectedDate: "2026-01-15", quantity: 70 }];
   assert.ok(first(changed).recommendedOrder < first(baseline).recommendedOrder);
 });
 
@@ -72,13 +73,16 @@ test("criterion 1 — changing partner forecast growth changes the recommendatio
 test("criterion 2 — seasonal demand follows the calendar-month pattern instead of a flat average", () => {
   const input = baseInput();
   const seasonalMonths = Array.from({ length: 24 }, (_, index) => `${2024 + Math.floor(index / 12)}-${String(index % 12 + 1).padStart(2, "0")}` as YearMonth);
-  input.monthlySales = seasonalMonths.map((month) => ({ sku: "SKU-1", productName: "SKU-1", month, unitsSold: month.endsWith("-12") ? 300 : 50 }));
+  input.monthlySales = seasonalMonths.map((month) => ({ sku: "SKU-1", productName: "SKU-1", month, unitsSold: month.endsWith("-01") ? 300 : 50 }));
   input.openingStocks = seasonalMonths.map((month) => ({ sku: "SKU-1", productName: "SKU-1", month, openingStock: 10 }));
   input.options.asOfMonth = "2025-12";
   input.options.maxAbsoluteHistoricalGrowthRate = 0;
-  const result = first(input);
-  assert.ok(result.seasonalIndex > 3);
-  assert.ok(result.adjustedDemandRate > result.baseMonthlyDemand);
+  input.options.defaultLeadTimeMonths = 1;
+  input.options.reviewPeriodMonths = 0;
+  const januaryResult = first(input);
+  assert.equal(januaryResult.seasonalForecast[0].month, "2026-01");
+  assert.ok(januaryResult.seasonalIndex > 3);
+  assert.ok(januaryResult.adjustedDemandRate > januaryResult.baseMonthlyDemand);
 });
 
 test("criterion 3 — inferred stockout excludes constrained demand and corrects need upward", () => {
@@ -204,8 +208,10 @@ test("unknown and late inbound ETA are exposed as planning exceptions", () => {
   ];
   const result = first(input);
   assert.equal(result.goodsInTransitUnknownEta, 20);
+  assert.equal(result.goodsInTransitWithinHorizon, 0);
   assert.equal(result.goodsInTransitAfterHorizon, 30);
-  assert.equal(result.etaAssumptionApplied, true);
+  assert.equal(result.etaAssumptionApplied, false);
+  assert.equal(result.unknownEtaExcluded, true);
   assert.ok(result.exceptions.includes("unknown_eta"));
   assert.ok(result.exceptions.includes("inbound_after_horizon"));
 });
@@ -223,11 +229,110 @@ test("days of supply and stockout gap are expressed as calendar dates and days",
 test("overstock produces an explicit do-not-order result", () => {
   const input = baseInput();
   input.openingStocks = stocks([20, 20, 20, 20, 20, 1000]);
+  input.currentStocks = [{ sku: "SKU-1", currentStock: 1000 }];
   const result = first(input);
   assert.equal(result.isOverstock, true);
   assert.ok(result.overstockMonths > 0);
   assert.equal(result.recommendedOrder, 0);
   assert.ok(result.exceptions.includes("surplus"));
+});
+
+test("opening stock is rolled forward by sales when no current snapshot exists", () => {
+  const input = baseInput();
+  delete input.currentStocks;
+  input.openingStocks = stocks([20, 20, 20, 20, 20, 180]);
+  const result = first(input);
+  assert.equal(result.openingStockAsOf, 180);
+  assert.equal(result.salesSinceOpening, 100);
+  assert.equal(result.currentStock, 80);
+  assert.equal(result.currentStockSource, "projected_from_opening");
+});
+
+test("explicit current-stock snapshot takes precedence over opening-stock projection", () => {
+  const input = baseInput();
+  input.currentStocks = [{ sku: "SKU-1", currentStock: 73 }];
+  const result = first(input);
+  assert.equal(result.currentStock, 73);
+  assert.equal(result.currentStockSource, "explicit_snapshot");
+});
+
+test("a zero-stock month with normal sales is not falsely treated as suppressed demand", () => {
+  const input = baseInput();
+  input.openingStocks = stocks([20, 20, 0, 20, 20, 20]);
+  const result = first(input);
+  assert.deepEqual(result.stockoutMonths, []);
+  assert.equal(result.stockoutAdjustmentUnitsPerMonth, 0);
+});
+
+test("supplier scope prevents identical SKU codes from mixing across suppliers", () => {
+  const input = baseInput();
+  input.monthlySales = [
+    ...sales([100, 100, 100, 100, 100, 100]).map((row) => ({ ...row, supplier: "Supplier A" })),
+    ...sales([10, 10, 10, 10, 10, 10]).map((row) => ({ ...row, supplier: "Supplier B" })),
+  ];
+  input.openingStocks = [
+    ...stocks([20, 20, 20, 20, 20, 20]).map((row) => ({ ...row, supplier: "Supplier A" })),
+    ...stocks([50, 50, 50, 50, 50, 50]).map((row) => ({ ...row, supplier: "Supplier B" })),
+  ];
+  input.currentStocks = [
+    { supplier: "Supplier A", sku: "SKU-1", currentStock: 20 },
+    { supplier: "Supplier B", sku: "SKU-1", currentStock: 50 },
+  ];
+  input.skuConfigs.push({ sku: "SKU-1", supplier: "Supplier B", category: "B", forecastGrowthRate: 0 });
+  const plan = calculateReplenishment(input);
+  assert.equal(plan.suppliers[0].items[0].baseMonthlyDemand, 100);
+  assert.equal(plan.suppliers[1].items[0].baseMonthlyDemand, 10);
+});
+
+test("future transactions cannot influence spike cleaning at an earlier as-of month", () => {
+  const baseline = baseInput();
+  const future = structuredClone(baseline);
+  future.salesTransactions.push(transaction(10_000, 500, "2026-02"));
+  assert.equal(first(future).excludedSpikeCount, first(baseline).excludedSpikeCount);
+  assert.equal(first(future).baseMonthlyDemand, first(baseline).baseMonthlyDemand);
+});
+
+test("recent repeated growth retains only recent large orders, not unrelated historical spikes", () => {
+  const input = baseInput();
+  input.monthlySales[0].unitsSold += 700;
+  input.monthlySales[4].unitsSold += 500;
+  input.monthlySales[5].unitsSold += 500;
+  input.salesTransactions.push(
+    transaction(700, 80, "2025-07"),
+    transaction(500, 81, "2025-11"),
+    transaction(500, 82, "2025-12"),
+  );
+  const result = first(input);
+  assert.equal(result.excludedSpikeCount, 1);
+  assert.equal(result.excludedSpikeUnits, 700);
+  assert.equal(result.retainedGrowthSpikeCount, 2);
+});
+
+test("split rows of one invoice are aggregated before spike detection", () => {
+  const input = baseInput();
+  input.monthlySales[5].unitsSold += 60;
+  input.salesTransactions.push(
+    { ...transaction(30, 90), invoiceNumber: "SPLIT-INVOICE" },
+    { ...transaction(30, 91), invoiceNumber: "SPLIT-INVOICE" },
+  );
+  const result = first(input);
+  assert.equal(result.excludedSpikeCount, 1);
+  assert.equal(result.excludedSpikeUnits, 60);
+  assert.deepEqual(result.excludedSpikeTransactionIds, ["SPLIT-INVOICE"]);
+});
+
+test("a recurring seasonal trough is not classified as dead stock", () => {
+  const input = baseInput();
+  const history = Array.from({ length: 24 }, (_, index) => `${2024 + Math.floor(index / 12)}-${String(index % 12 + 1).padStart(2, "0")}` as YearMonth);
+  input.monthlySales = history.map((month) => ({
+    sku: "SKU-1", productName: "SKU-1", month,
+    unitsSold: Number(month.slice(5, 7)) >= 10 ? 5 : 100,
+  }));
+  input.openingStocks = history.map((month) => ({ sku: "SKU-1", productName: "SKU-1", month, openingStock: 20 }));
+  input.options.asOfMonth = "2025-12";
+  const result = first(input);
+  assert.equal(result.stockLifecycleStatus, "active");
+  assert.ok(result.planningMonthlyDemand > 0);
 });
 
 test("dead stock blocks automatic replenishment and slow stock uses recent demand", () => {

@@ -6,6 +6,7 @@ import type {
   MonthlySales,
   SalesTransaction,
   SkuCategory,
+  SkuCurrentStock,
   SkuReservation,
   XlsxInput,
   YearMonth,
@@ -114,15 +115,21 @@ export function parseSalesTransactions(input: XlsxInput, sheetName?: string): Sa
     const occurredAt = isoDate(row[date]);
     const sourceQuantity = numberValue(row[quantity]);
     const skuValue = text(row[sku]);
-    if (!occurredAt || sourceQuantity === null || sourceQuantity === 0 || !skuValue) return [];
+    const documentValue = document >= 0 ? text(row[document]) : "";
+    // The real journals contain a handful of receipts and customer-order documents among shipment rows.
+    // They are inventory movements or pre-shipment intentions, not completed sales demand.
+    const nonSaleDocument = /приходная накладная|заказ покупателя/iu.test(documentValue);
+    if (!occurredAt || sourceQuantity === null || sourceQuantity === 0 || !skuValue || nonSaleDocument) return [];
     return [{
       occurredAt,
       invoiceNumber: text(row[invoice]),
-      ...(document >= 0 && text(row[document]) ? { document: text(row[document]) } : {}),
+      ...(documentValue ? { document: documentValue } : {}),
       sku: skuValue,
       productName: text(row[product]),
       ...(unit >= 0 && text(row[unit]) ? { unit: text(row[unit]) } : {}),
       ...(warehouse >= 0 && text(row[warehouse]) ? { warehouse: text(row[warehouse]) } : {}),
+      // Sales are negative in the older extracts and positive in newer ones; document semantics, rather
+      // than sign alone, identify a sale. Preserve the signed source value for audit.
       unitsSold: Math.abs(sourceQuantity),
       sourceQuantity,
     }];
@@ -267,5 +274,20 @@ export function parseSkuReservations(input: XlsxInput, sheetName?: string): SkuR
     const skuValue = text(row[sku]);
     const reservedValue = numberValue(row[reserved]);
     return skuValue && reservedValue !== null ? [{ sku: skuValue, reservedStock: Math.max(0, reservedValue) }] : [];
+  });
+}
+
+/** Reads the current physical-stock snapshot when the supplier dashboard exposes one. */
+export function parseSkuCurrentStocks(input: XlsxInput, sheetName?: string): SkuCurrentStock[] {
+  const rows = rowsFromWorkbook(input, sheetName);
+  const headerIndex = findHeaderRow(rows, [/код 1с/, /^остаток$/]);
+  const header = rows[headerIndex];
+  const sku = requireColumn(header, [/^код 1с$/], "Код 1с");
+  // Exact matching intentionally avoids the neighbouring "Остаток ТЗ" and "Свободный остаток" fields.
+  const stock = requireColumn(header, [/^остаток$/], "Остаток");
+  return rows.slice(headerIndex + 1).flatMap((row) => {
+    const skuValue = text(row[sku]);
+    const stockValue = numberValue(row[stock]);
+    return skuValue && stockValue !== null ? [{ sku: skuValue, currentStock: Math.max(0, stockValue) }] : [];
   });
 }

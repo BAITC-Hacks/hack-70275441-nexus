@@ -1,5 +1,5 @@
 import type { ReplenishmentInput, ReplenishmentOptions, SkuPlanningConfig } from "./calculation.ts";
-import type { InboundShipment, MinimumOrderQuantity, MonthlyOpeningStock, MonthlySales, SalesTransaction, SkuCategory, SkuReservation, YearMonth } from "./types.ts";
+import type { InboundShipment, MinimumOrderQuantity, MonthlyOpeningStock, MonthlySales, SalesTransaction, SkuCategory, SkuCurrentStock, SkuReservation, YearMonth } from "./types.ts";
 
 export interface SupplierParsedData {
   supplier: string;
@@ -10,6 +10,7 @@ export interface SupplierParsedData {
   minimumOrderQuantities: MinimumOrderQuantity[];
   categories?: SkuCategory[];
   reservations?: SkuReservation[];
+  currentStocks?: SkuCurrentStock[];
 }
 
 export interface AssemblyAssumptions {
@@ -44,12 +45,17 @@ function latestMonth(rows: MonthlyOpeningStock[]): YearMonth {
 
 export function assembleReplenishmentInput(suppliers: SupplierParsedData[], assumptions: AssemblyAssumptions = DEFAULT_ASSEMBLY_ASSUMPTIONS): ReplenishmentInput {
   if (!suppliers.length) throw new Error("Не переданы данные поставщиков.");
-  const monthlySales = suppliers.flatMap((data) => data.monthlySales);
-  const openingStocks = suppliers.flatMap((data) => data.openingStocks);
-  const inboundShipments = suppliers.flatMap((data) => data.inboundShipments);
-  const salesTransactions = suppliers.flatMap((data) => data.salesTransactions);
-  const minimumOrderQuantities = suppliers.flatMap((data) => data.minimumOrderQuantities);
-  const reservations = suppliers.flatMap((data) => data.reservations ?? []);
+  // Supplier scope is attached here rather than in the file parsers: a workbook describes one supplier,
+  // while the normalized calculation may contain identical 1C codes from several suppliers.
+  const scoped = <T extends { sku: string }>(data: SupplierParsedData, rows: T[]): Array<T & { supplier: string }> =>
+    rows.map((row) => ({ ...row, supplier: data.supplier }));
+  const monthlySales = suppliers.flatMap((data) => scoped(data, data.monthlySales));
+  const openingStocks = suppliers.flatMap((data) => scoped(data, data.openingStocks));
+  const inboundShipments = suppliers.flatMap((data) => scoped(data, data.inboundShipments));
+  const salesTransactions = suppliers.flatMap((data) => scoped(data, data.salesTransactions));
+  const minimumOrderQuantities = suppliers.flatMap((data) => scoped(data, data.minimumOrderQuantities));
+  const reservations = suppliers.flatMap((data) => scoped(data, data.reservations ?? []));
+  const currentStocks = suppliers.flatMap((data) => scoped(data, data.currentStocks ?? []));
   const skuConfigs: SkuPlanningConfig[] = suppliers.flatMap((data) => {
     const categoryBySku = new Map(data.categories?.map((item) => [item.sku, item.category]));
     return [...new Set(data.monthlySales.map((item) => item.sku))].map((sku) => ({
@@ -68,5 +74,5 @@ export function assembleReplenishmentInput(suppliers: SupplierParsedData[], assu
     reviewPeriodMonths: assumptions.reviewPeriodMonths,
     categoryServiceLevel,
   };
-  return { monthlySales, openingStocks, inboundShipments, salesTransactions, minimumOrderQuantities, reservations, skuConfigs, options };
+  return { monthlySales, openingStocks, inboundShipments, salesTransactions, minimumOrderQuantities, reservations, currentStocks, skuConfigs, options };
 }

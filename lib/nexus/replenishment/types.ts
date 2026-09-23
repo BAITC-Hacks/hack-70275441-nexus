@@ -1,6 +1,8 @@
 export type YearMonth = `${number}-${string}`;
 
 export interface SalesTransaction {
+  /** Added by the assembly layer so identical SKU codes from different suppliers cannot collide. */
+  supplier?: string;
   occurredAt: string;
   invoiceNumber: string;
   document?: string;
@@ -8,13 +10,14 @@ export interface SalesTransaction {
   productName: string;
   unit?: string;
   warehouse?: string;
-  /** Absolute quantity sold. The source journal stores sales as negative quantities. */
+  /** Absolute quantity sold. Partner exports switch sign convention between years. */
   unitsSold: number;
   /** Original signed value retained for auditability. */
   sourceQuantity: number;
 }
 
 export interface MonthlySales {
+  supplier?: string;
   sku: string;
   productName: string;
   unit?: string;
@@ -23,6 +26,7 @@ export interface MonthlySales {
 }
 
 export interface MonthlyOpeningStock {
+  supplier?: string;
   sku: string;
   productName: string;
   unit?: string;
@@ -31,6 +35,7 @@ export interface MonthlyOpeningStock {
 }
 
 export interface InboundShipment {
+  supplier?: string;
   sku: string;
   supplierArticle?: string;
   productName: string;
@@ -42,6 +47,7 @@ export interface InboundShipment {
 }
 
 export interface MinimumOrderQuantity {
+  supplier?: string;
   sku: string;
   supplierArticle?: string;
   productName: string;
@@ -50,13 +56,22 @@ export interface MinimumOrderQuantity {
 }
 
 export interface SkuCategory {
+  supplier?: string;
   sku: string;
   category: string;
 }
 
 export interface SkuReservation {
+  supplier?: string;
   sku: string;
   reservedStock: number;
+}
+
+export interface SkuCurrentStock {
+  supplier?: string;
+  sku: string;
+  /** Current physical stock snapshot from a supplier dashboard. */
+  currentStock: number;
 }
 
 export type XlsxInput = ArrayBuffer | Uint8Array;
