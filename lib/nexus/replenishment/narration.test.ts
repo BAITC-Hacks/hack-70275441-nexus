@@ -20,10 +20,16 @@ const recommendation: ReplenishmentNarrationInput = {
   stockoutMonths: ["2026-07"],
   excludedSpikeCount: 1,
   excludedSpikeUnits: 80,
+  retainedGrowthSpikeCount: 0,
+  retainedGrowthSpikeUnits: 0,
+  spikeOrderImpactEstimate: 40,
   currentStock: 20,
   reservedStock: 4,
   availableStock: 16,
   goodsInTransitWithinHorizon: 7,
+  goodsInTransitUnknownEta: 0,
+  goodsInTransitAfterHorizon: 0,
+  etaAssumptionApplied: false,
   demandStdDev: 3.5,
   serviceLevel: 0.98,
   safetyStockZScore: 2.0537,
@@ -32,6 +38,10 @@ const recommendation: ReplenishmentNarrationInput = {
   currentPosition: 23,
   recommendedOrder: 30,
   urgency: "high",
+  demandPattern: "stable",
+  nonZeroDemandFrequency: 1,
+  forecastMethod: "seasonal_trend",
+  exceptions: ["one_off_spike"],
 };
 
 test("narration API returns FALLBACK instead of failing when the API key is absent", async () => {

@@ -42,6 +42,8 @@ export interface ReplenishmentInput {
 }
 
 export type ReplenishmentUrgency = "high" | "medium" | "low";
+export type DemandPattern = "stable" | "volatile" | "intermittent";
+export type ReplenishmentException = "stockout" | "one_off_spike" | "sustained_growth_signal" | "unknown_eta" | "inbound_after_horizon" | "surplus";
 
 export interface ReplenishmentRecommendation {
   sku: string;
@@ -61,10 +63,16 @@ export interface ReplenishmentRecommendation {
   excludedSpikeCount: number;
   excludedSpikeUnits: number;
   excludedSpikeTransactionIds: string[];
+  retainedGrowthSpikeCount: number;
+  retainedGrowthSpikeUnits: number;
+  spikeOrderImpactEstimate: number;
   currentStock: number;
   reservedStock: number;
   availableStock: number;
   goodsInTransitWithinHorizon: number;
+  goodsInTransitUnknownEta: number;
+  goodsInTransitAfterHorizon: number;
+  etaAssumptionApplied: boolean;
   leadTimeMonths: number;
   reviewPeriodMonths: number;
   demandStdDev: number;
@@ -78,6 +86,10 @@ export interface ReplenishmentRecommendation {
   recommendedOrder: number;
   coverageMonths: number | null;
   urgency: ReplenishmentUrgency;
+  demandPattern: DemandPattern;
+  nonZeroDemandFrequency: number;
+  forecastMethod: "seasonal_trend" | "intermittent_rate";
+  exceptions: ReplenishmentException[];
 }
 
 export interface SupplierReplenishmentGroup {
@@ -134,9 +146,10 @@ function spikeThreshold(transactions: SalesTransaction[]): number {
   const center = median(values);
   const mad = median(values.map((value) => Math.abs(value - center)));
   const q1 = quantile(values, 0.25), q3 = quantile(values, 0.75);
-  // Both robust rules are considered, with a 3x-median floor preventing zero-MAD series from
-  // classifying ordinary small variation as a one-off order.
-  return Math.max(center * 3, center + 3 * 1.4826 * mad, q3 + 1.5 * (q3 - q1));
+  // Use the less contamination-sensitive robust bound, with a 3x-median floor preventing zero-MAD
+  // series from classifying ordinary small variation as a large order. Taking the larger IQR bound would
+  // let two genuine large transactions inflate Q3 enough to hide the very repeated-growth signal sought.
+  return Math.max(center * 3, Math.min(center + 3 * 1.4826 * mad, q3 + 1.5 * (q3 - q1)));
 }
 
 function monthOfDate(isoDate: string): YearMonth | null {
@@ -194,7 +207,14 @@ function recommendationForSku(input: ReplenishmentInput, indexed: IndexedInput, 
   if (!sales.length) throw new Error(`No monthly sales found for ${config.sku}.`);
   const transactions = indexed.transactions.get(config.sku) ?? [];
   const threshold = spikeThreshold(transactions);
-  const spikes = transactions.filter((item) => item.unitsSold > threshold);
+  const spikeCandidates = transactions.filter((item) => item.unitsSold > threshold);
+  const candidateMonths = [...new Set(spikeCandidates.map((item) => monthOfDate(item.occurredAt)).filter((month): month is YearMonth => month !== null))].sort();
+  const recentCandidateMonths = candidateMonths.filter((month) => month >= addMonths(options.asOfMonth, -2));
+  // A repeated large order in at least two distinct recent months is retained as a deterministic growth
+  // signal. A solitary large transaction remains a one-off spike and is removed from regular demand.
+  const sustainedGrowthSignal = recentCandidateMonths.length >= 2;
+  const spikes = sustainedGrowthSignal ? [] : spikeCandidates;
+  const retainedGrowthSpikes = sustainedGrowthSignal ? spikeCandidates : [];
   const spikeUnitsByMonth = new Map<YearMonth, number>();
   for (const spike of spikes) {
     const month = monthOfDate(spike.occurredAt);
@@ -215,10 +235,18 @@ function recommendationForSku(input: ReplenishmentInput, indexed: IndexedInput, 
   const demandWithoutStockouts = cleaned.filter((item) => !stockoutSet.has(item.month));
   const rawMonthlyDemand = average(cleaned.map((item) => item.unitsSold));
   const baseMonthlyDemand = average(demandWithoutStockouts.map((item) => item.unitsSold));
+  const demandValues = demandWithoutStockouts.map((item) => item.unitsSold);
+  const nonZeroDemandFrequency = demandValues.length ? demandValues.filter((value) => value > 0).length / demandValues.length : 0;
+  const preliminaryStdDev = standardDeviation(demandValues);
+  const coefficientOfVariation = baseMonthlyDemand > 0 ? preliminaryStdDev / baseMonthlyDemand : 0;
+  const demandPattern: DemandPattern = nonZeroDemandFrequency <= 0.5
+    ? "intermittent"
+    : coefficientOfVariation >= 0.75 ? "volatile" : "stable";
+  const forecastMethod = demandPattern === "intermittent" ? "intermittent_rate" : "seasonal_trend";
 
   const calendarMonth = Number(options.asOfMonth.slice(5, 7));
   const sameCalendarMonth = demandWithoutStockouts.filter((item) => Number(item.month.slice(5, 7)) === calendarMonth);
-  const seasonalIndex = baseMonthlyDemand > 0 && sameCalendarMonth.length
+  const seasonalIndex = forecastMethod === "seasonal_trend" && baseMonthlyDemand > 0 && sameCalendarMonth.length
     ? average(sameCalendarMonth.map((item) => item.unitsSold)) / baseMonthlyDemand
     : 1;
 
@@ -226,7 +254,11 @@ function recommendationForSku(input: ReplenishmentInput, indexed: IndexedInput, 
   const recent = demandWithoutStockouts.slice(-window).map((item) => item.unitsSold);
   const earlier = demandWithoutStockouts.slice(-window * 2, -window).map((item) => item.unitsSold);
   const earlierAverage = average(earlier), recentAverage = average(recent);
-  const rawHistoricalGrowth = earlierAverage > 0 && earlier.length ? recentAverage / earlierAverage - 1 : 0;
+  // Sparse demand uses an occurrence-rate model; a short run of zero/non-zero months is not treated as
+  // a continuous trend because that would amplify timing noise as growth.
+  const rawHistoricalGrowth = forecastMethod === "intermittent_rate"
+    ? 0
+    : earlierAverage > 0 && earlier.length ? recentAverage / earlierAverage - 1 : 0;
   const growthLimit = options.maxAbsoluteHistoricalGrowthRate ?? 0.5;
   const historicalGrowthRate = clamp(rawHistoricalGrowth, -growthLimit, growthLimit);
   const combinedGrowthFactor = (1 + historicalGrowthRate) * (1 + config.forecastGrowthRate);
@@ -246,10 +278,13 @@ function recommendationForSku(input: ReplenishmentInput, indexed: IndexedInput, 
   const leadTimeMonths = config.leadTimeMonths ?? options.defaultLeadTimeMonths;
   const horizonMonths = leadTimeMonths + options.reviewPeriodMonths;
   const horizonEnd = endOfMonth(addMonths(options.asOfMonth, Math.ceil(horizonMonths)));
-  const goodsInTransitWithinHorizon = (indexed.inbound.get(config.sku) ?? [])
+  const skuInbound = indexed.inbound.get(config.sku) ?? [];
+  const goodsInTransitWithinHorizon = skuInbound
     .filter((item) => item.expectedDate === null || Date.parse(item.expectedDate) <= horizonEnd)
     .reduce((sum, item) => sum + item.quantity, 0);
-  const demandStdDev = standardDeviation(demandWithoutStockouts.map((item) => item.unitsSold));
+  const goodsInTransitUnknownEta = skuInbound.filter((item) => item.expectedDate === null).reduce((sum, item) => sum + item.quantity, 0);
+  const goodsInTransitAfterHorizon = skuInbound.filter((item) => item.expectedDate !== null && Date.parse(item.expectedDate) > horizonEnd).reduce((sum, item) => sum + item.quantity, 0);
+  const demandStdDev = preliminaryStdDev;
   const serviceLevel = options.categoryServiceLevel[config.category];
   const safetyStockZScore = serviceLevelZScore(serviceLevel);
   const safetyStock = safetyStockZScore * demandStdDev * Math.sqrt(horizonMonths);
@@ -272,6 +307,14 @@ function recommendationForSku(input: ReplenishmentInput, indexed: IndexedInput, 
   const urgency: ReplenishmentUrgency = coverageMonths !== null && coverageMonths < leadTimeMonths
     ? "high"
     : coverageMonths !== null && coverageMonths < horizonMonths ? "medium" : "low";
+  const exceptions: ReplenishmentException[] = [
+    ...(stockoutMonths.length ? ["stockout" as const] : []),
+    ...(spikes.length ? ["one_off_spike" as const] : []),
+    ...(retainedGrowthSpikes.length ? ["sustained_growth_signal" as const] : []),
+    ...(goodsInTransitUnknownEta > 0 ? ["unknown_eta" as const] : []),
+    ...(goodsInTransitAfterHorizon > 0 ? ["inbound_after_horizon" as const] : []),
+    ...(coverageMonths !== null && coverageMonths > horizonMonths * 2 ? ["surplus" as const] : []),
+  ];
 
   return {
     sku: config.sku,
@@ -291,10 +334,16 @@ function recommendationForSku(input: ReplenishmentInput, indexed: IndexedInput, 
     excludedSpikeCount: spikes.length,
     excludedSpikeUnits: round(spikes.reduce((sum, item) => sum + item.unitsSold, 0)),
     excludedSpikeTransactionIds: spikes.map((item) => item.invoiceNumber),
+    retainedGrowthSpikeCount: retainedGrowthSpikes.length,
+    retainedGrowthSpikeUnits: round(retainedGrowthSpikes.reduce((sum, item) => sum + item.unitsSold, 0)),
+    spikeOrderImpactEstimate: round((spikes.reduce((sum, item) => sum + item.unitsSold, 0) / Math.max(1, sales.length)) * horizonMonths),
     currentStock: round(currentStock),
     reservedStock: round(reservedStock),
     availableStock: round(availableStock),
     goodsInTransitWithinHorizon: round(goodsInTransitWithinHorizon),
+    goodsInTransitUnknownEta: round(goodsInTransitUnknownEta),
+    goodsInTransitAfterHorizon: round(goodsInTransitAfterHorizon),
+    etaAssumptionApplied: goodsInTransitUnknownEta > 0,
     leadTimeMonths: round(leadTimeMonths),
     reviewPeriodMonths: round(options.reviewPeriodMonths),
     demandStdDev: round(demandStdDev),
@@ -308,6 +357,10 @@ function recommendationForSku(input: ReplenishmentInput, indexed: IndexedInput, 
     recommendedOrder: round(recommendedOrder),
     coverageMonths: coverageMonths === null ? null : round(coverageMonths),
     urgency,
+    demandPattern,
+    nonZeroDemandFrequency: round(nonZeroDemandFrequency),
+    forecastMethod,
+    exceptions,
   };
 }
 

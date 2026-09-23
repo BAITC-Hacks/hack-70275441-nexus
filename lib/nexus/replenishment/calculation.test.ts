@@ -164,3 +164,48 @@ test("reserved customer stock reduces availability and increases the recommended
   assert.equal(reserved.currentPosition, baseline.currentPosition - 15);
   assert.ok(reserved.recommendedOrder > baseline.recommendedOrder);
 });
+
+test("repeated recent large transactions are retained as a sustained growth signal", () => {
+  const input = baseInput();
+  input.monthlySales[4].unitsSold += 500;
+  input.monthlySales[5].unitsSold += 500;
+  input.salesTransactions.push(transaction(500, 90, "2025-11"), transaction(500, 91, "2025-12"));
+  const result = first(input);
+  assert.equal(result.excludedSpikeCount, 0);
+  assert.equal(result.retainedGrowthSpikeCount, 2);
+  assert.ok(result.retainedGrowthSpikeUnits >= 1000);
+  assert.ok(result.exceptions.includes("sustained_growth_signal"));
+});
+
+test("one-off spike exposes its estimated order impact", () => {
+  const input = baseInput();
+  input.monthlySales[5].unitsSold += 600;
+  input.salesTransactions.push(transaction(600, 90));
+  const result = first(input);
+  assert.equal(result.excludedSpikeCount, 1);
+  assert.ok(result.spikeOrderImpactEstimate > 0);
+  assert.ok(result.exceptions.includes("one_off_spike"));
+});
+
+test("intermittent demand is classified and uses the intermittent-rate strategy", () => {
+  const input = baseInput();
+  input.monthlySales = sales([0, 0, 90, 0, 0, 90]);
+  const result = first(input);
+  assert.equal(result.demandPattern, "intermittent");
+  assert.equal(result.forecastMethod, "intermittent_rate");
+  assert.equal(result.seasonalIndex, 1);
+});
+
+test("unknown and late inbound ETA are exposed as planning exceptions", () => {
+  const input = baseInput();
+  input.inboundShipments = [
+    { sku: "SKU-1", productName: "SKU-1", shipmentId: "UNKNOWN", expectedDate: null, quantity: 20 },
+    { sku: "SKU-1", productName: "SKU-1", shipmentId: "LATE", expectedDate: "2027-01-01", quantity: 30 },
+  ];
+  const result = first(input);
+  assert.equal(result.goodsInTransitUnknownEta, 20);
+  assert.equal(result.goodsInTransitAfterHorizon, 30);
+  assert.equal(result.etaAssumptionApplied, true);
+  assert.ok(result.exceptions.includes("unknown_eta"));
+  assert.ok(result.exceptions.includes("inbound_after_horizon"));
+});

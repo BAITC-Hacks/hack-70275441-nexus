@@ -10,9 +10,12 @@ export const REPLENISHMENT_NARRATOR_SYSTEM_PROMPT = `Ты пишешь крат�
 export type ReplenishmentNarrationInput = Pick<ReplenishmentRecommendation,
   "sku" | "productName" | "supplier" | "category" | "baseMonthlyDemand" | "seasonalIndex" |
   "historicalGrowthRate" | "forecastGrowthRate" | "stockoutAdjustmentUnitsPerMonth" | "stockoutMonths" |
-  "excludedSpikeCount" | "excludedSpikeUnits" | "currentStock" | "reservedStock" | "availableStock" |
-  "goodsInTransitWithinHorizon" | "demandStdDev" | "serviceLevel" | "safetyStockZScore" | "safetyStock" |
-  "targetPosition" | "currentPosition" | "recommendedOrder" | "urgency"
+  "excludedSpikeCount" | "excludedSpikeUnits" | "retainedGrowthSpikeCount" | "retainedGrowthSpikeUnits" |
+  "spikeOrderImpactEstimate" | "currentStock" | "reservedStock" | "availableStock" |
+  "goodsInTransitWithinHorizon" | "goodsInTransitUnknownEta" | "goodsInTransitAfterHorizon" |
+  "etaAssumptionApplied" | "demandStdDev" | "serviceLevel" | "safetyStockZScore" | "safetyStock" |
+  "targetPosition" | "currentPosition" | "recommendedOrder" | "urgency" | "demandPattern" |
+  "nonZeroDemandFrequency" | "forecastMethod" | "exceptions"
 >;
 
 export interface ReplenishmentNarrationResult {
@@ -41,16 +44,19 @@ const fallback = (): ReplenishmentNarrationResult => ({ narrative: "", source: "
 export function isReplenishmentNarrationInput(value: unknown): value is ReplenishmentNarrationInput {
   if (!value || typeof value !== "object") return false;
   const item = value as Record<string, unknown>;
-  const strings = ["sku", "productName", "supplier", "category"];
+  const strings = ["sku", "productName", "supplier", "category", "demandPattern", "forecastMethod"];
   const numbers = [
     "baseMonthlyDemand", "seasonalIndex", "historicalGrowthRate", "forecastGrowthRate",
-    "stockoutAdjustmentUnitsPerMonth", "excludedSpikeCount", "excludedSpikeUnits", "currentStock",
-    "reservedStock", "availableStock", "goodsInTransitWithinHorizon", "demandStdDev", "serviceLevel",
-    "safetyStockZScore", "safetyStock", "targetPosition", "currentPosition", "recommendedOrder",
+    "stockoutAdjustmentUnitsPerMonth", "excludedSpikeCount", "excludedSpikeUnits", "retainedGrowthSpikeCount",
+    "retainedGrowthSpikeUnits", "spikeOrderImpactEstimate", "currentStock", "reservedStock", "availableStock",
+    "goodsInTransitWithinHorizon", "goodsInTransitUnknownEta", "goodsInTransitAfterHorizon", "demandStdDev", "serviceLevel",
+    "safetyStockZScore", "safetyStock", "targetPosition", "currentPosition", "recommendedOrder", "nonZeroDemandFrequency",
   ];
   return strings.every((key) => typeof item[key] === "string" && item[key] !== "")
     && numbers.every((key) => typeof item[key] === "number" && Number.isFinite(item[key]))
     && Array.isArray(item.stockoutMonths) && item.stockoutMonths.every((month) => typeof month === "string")
+    && typeof item.etaAssumptionApplied === "boolean"
+    && Array.isArray(item.exceptions) && item.exceptions.every((exception) => typeof exception === "string")
     && ["high", "medium", "low"].includes(String(item.urgency));
 }
 

@@ -10,6 +10,8 @@ import styles from "./replenishment.module.css";
 type FileKind = "transactions" | "monthlySales" | "openingStocks" | "inbound" | "moq";
 type SupplierKey = "iek" | "systeme";
 type FilesState = Record<SupplierKey, Partial<Record<FileKind, File>>>;
+type ExceptionView = "all" | "urgent" | "anomaly" | "supply" | "surplus";
+type ManagerDecision = { quantity: number; status: "draft" | "confirmed" };
 
 const FILE_FIELDS: Array<{ kind: FileKind; label: string; hint: string }> = [
   { kind: "transactions", label: "Динамика продаж", hint: "Транзакции и накладные" },
@@ -27,6 +29,25 @@ const number = new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 1 });
 const percent = new Intl.NumberFormat("ru-RU", { style: "percent", maximumFractionDigits: 0 });
 const urgencyLabel = { high: "Срочно", medium: "Контроль", low: "Планово" } as const;
 const urgencyRank = { high: 0, medium: 1, low: 2 } as const;
+const demandPatternLabel = { stable: "Стабильный", volatile: "Волатильный", intermittent: "Прерывистый" } as const;
+const exceptionViews: Array<{ key: ExceptionView; label: string }> = [
+  { key: "all", label: "Все SKU" }, { key: "urgent", label: "Заказать сейчас" },
+  { key: "anomaly", label: "Аномалии спроса" }, { key: "supply", label: "Риски поставки" },
+  { key: "surplus", label: "Избыток" },
+];
+
+function matchesExceptionView(item: ReplenishmentRecommendation, view: ExceptionView): boolean {
+  if (view === "urgent") return item.urgency === "high";
+  if (view === "anomaly") return item.exceptions.some((value) => ["stockout", "one_off_spike", "sustained_growth_signal"].includes(value));
+  if (view === "supply") return item.exceptions.some((value) => ["unknown_eta", "inbound_after_horizon"].includes(value));
+  if (view === "surplus") return item.exceptions.includes("surplus");
+  return true;
+}
+
+function validManagerQuantity(quantity: number, moq: number | null): number {
+  const safe = Math.max(0, Number.isFinite(quantity) ? quantity : 0);
+  return moq && safe > 0 ? Math.ceil(safe / moq) * moq : safe;
+}
 
 async function parseSupplier(key: SupplierKey, files: Partial<Record<FileKind, File>>): Promise<SupplierParsedData> {
   for (const field of FILE_FIELDS) if (!files[field.kind]) throw new Error(`Не выбран файл «${field.label}» для ${key === "iek" ? "IEK" : "Systeme Electric"}.`);
@@ -46,21 +67,25 @@ async function parseSupplier(key: SupplierKey, files: Partial<Record<FileKind, F
 }
 
 function explanation(item: ReplenishmentRecommendation): string {
-  return `Базовый спрос ${number.format(item.baseMonthlyDemand)} ед./мес.; сезонность ×${number.format(item.seasonalIndex)}; исторический рост ${percent.format(item.historicalGrowthRate)}; внешний прогноз ${percent.format(item.forecastGrowthRate)}. Поправка stockout: +${number.format(item.stockoutAdjustmentUnitsPerMonth)} ед./мес. (${item.stockoutMonths.length} мес.); исключено всплесков: ${item.excludedSpikeCount} на ${number.format(item.excludedSpikeUnits)} ед. Страховой запас ${number.format(item.safetyStock)} = z ${number.format(item.safetyStockZScore)} × σ ${number.format(item.demandStdDev)} × √горизонта, уровень сервиса ${percent.format(item.serviceLevel)}. Позиция: остаток ${number.format(item.currentStock)} − резерв ${number.format(item.reservedStock)} + в пути ${number.format(item.goodsInTransitWithinHorizon)}; доступный остаток ${number.format(item.availableStock)}, целевой уровень ${number.format(item.targetPosition)}.`;
+  return `Тип спроса: ${demandPatternLabel[item.demandPattern]}, метод ${item.forecastMethod === "intermittent_rate" ? "частота × размер ненулевого спроса" : "сезонность + тренд"}. Базовый спрос ${number.format(item.baseMonthlyDemand)} ед./мес.; сезонность ×${number.format(item.seasonalIndex)}; исторический рост ${percent.format(item.historicalGrowthRate)}; внешний прогноз ${percent.format(item.forecastGrowthRate)}. Поправка stockout: +${number.format(item.stockoutAdjustmentUnitsPerMonth)} ед./мес. (${item.stockoutMonths.length} мес.); исключено всплесков: ${item.excludedSpikeCount} на ${number.format(item.excludedSpikeUnits)} ед., оценка влияния на заказ ${number.format(item.spikeOrderImpactEstimate)} ед.; сохранено повторных крупных продаж: ${item.retainedGrowthSpikeCount}. Страховой запас ${number.format(item.safetyStock)} = z ${number.format(item.safetyStockZScore)} × σ ${number.format(item.demandStdDev)} × √горизонта, уровень сервиса ${percent.format(item.serviceLevel)}. Позиция: остаток ${number.format(item.currentStock)} − резерв ${number.format(item.reservedStock)} + в пути ${number.format(item.goodsInTransitWithinHorizon)}; без точного ETA ${number.format(item.goodsInTransitUnknownEta)}, после горизонта ${number.format(item.goodsInTransitAfterHorizon)}; доступный остаток ${number.format(item.availableStock)}, целевой уровень ${number.format(item.targetPosition)}.`;
 }
 
 function narrationInput(item: ReplenishmentRecommendation): ReplenishmentNarrationInput {
   const {
     sku, productName, supplier, category, baseMonthlyDemand, seasonalIndex, historicalGrowthRate,
     forecastGrowthRate, stockoutAdjustmentUnitsPerMonth, stockoutMonths, excludedSpikeCount,
-    excludedSpikeUnits, currentStock, reservedStock, availableStock, goodsInTransitWithinHorizon,
+    excludedSpikeUnits, retainedGrowthSpikeCount, retainedGrowthSpikeUnits, spikeOrderImpactEstimate,
+    currentStock, reservedStock, availableStock, goodsInTransitWithinHorizon, goodsInTransitUnknownEta,
+    goodsInTransitAfterHorizon, etaAssumptionApplied, demandPattern, nonZeroDemandFrequency, forecastMethod, exceptions,
     demandStdDev, serviceLevel, safetyStockZScore, safetyStock, targetPosition, currentPosition,
     recommendedOrder, urgency,
   } = item;
   return {
     sku, productName, supplier, category, baseMonthlyDemand, seasonalIndex, historicalGrowthRate,
     forecastGrowthRate, stockoutAdjustmentUnitsPerMonth, stockoutMonths, excludedSpikeCount,
-    excludedSpikeUnits, currentStock, reservedStock, availableStock, goodsInTransitWithinHorizon,
+    excludedSpikeUnits, retainedGrowthSpikeCount, retainedGrowthSpikeUnits, spikeOrderImpactEstimate,
+    currentStock, reservedStock, availableStock, goodsInTransitWithinHorizon, goodsInTransitUnknownEta,
+    goodsInTransitAfterHorizon, etaAssumptionApplied, demandPattern, nonZeroDemandFrequency, forecastMethod, exceptions,
     demandStdDev, serviceLevel, safetyStockZScore, safetyStock, targetPosition, currentPosition,
     recommendedOrder, urgency,
   };
@@ -74,16 +99,18 @@ export function ReplenishmentWorkspace() {
   const [query, setQuery] = useState("");
   const [narratives, setNarratives] = useState<Record<string, string>>({});
   const [narrating, setNarrating] = useState<Record<string, boolean>>({});
+  const [exceptionView, setExceptionView] = useState<ExceptionView>("all");
+  const [decisions, setDecisions] = useState<Record<string, ManagerDecision>>({});
   const selectedCount = Object.values(files).flatMap((group) => Object.values(group)).length;
   const ready = selectedCount === FILE_FIELDS.length * SUPPLIERS.length;
 
   const visible = useMemo(() => plan?.suppliers.map((group) => ({
     ...group,
-    items: group.items.filter((item) => `${item.sku} ${item.productName}`.toLocaleLowerCase("ru-RU").includes(query.toLocaleLowerCase("ru-RU"))).sort((a, b) => urgencyRank[a.urgency] - urgencyRank[b.urgency] || b.recommendedOrder - a.recommendedOrder),
-  })) ?? [], [plan, query]);
+    items: group.items.filter((item) => matchesExceptionView(item, exceptionView) && `${item.sku} ${item.productName}`.toLocaleLowerCase("ru-RU").includes(query.toLocaleLowerCase("ru-RU"))).sort((a, b) => urgencyRank[a.urgency] - urgencyRank[b.urgency] || b.recommendedOrder - a.recommendedOrder),
+  })) ?? [], [plan, query, exceptionView]);
 
   const run = async () => {
-    setRunning(true); setError(""); setPlan(undefined);
+    setRunning(true); setError(""); setPlan(undefined); setDecisions({}); setExceptionView("all");
     try {
       // Yield once so the pending state paints before large partner workbooks are decoded.
       await new Promise((resolve) => setTimeout(resolve, 20));
@@ -155,12 +182,17 @@ export function ReplenishmentWorkspace() {
         <div><small>СРОЧНЫХ</small><b>{plan.suppliers.flatMap((group) => group.items).filter((item) => item.urgency === "high").length}</b></div>
         <label><small>ПОИСК ПО SKU</small><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Код или наименование" /></label>
       </div>
+      <nav className={styles.exceptionBar} aria-label="Фильтр исключений">{exceptionViews.map((view) => {
+        const count = plan.suppliers.flatMap((group) => group.items).filter((item) => matchesExceptionView(item, view.key)).length;
+        return <button key={view.key} className={exceptionView === view.key ? styles.activeException : ""} onClick={() => setExceptionView(view.key)}>{view.label}<b>{count}</b></button>;
+      })}</nav>
       {visible.map((group) => <article className={styles.resultGroup} key={group.supplier}>
         <header><div><span>ПОСТАВЩИК</span><h3>{group.supplier}</h3></div><b>{group.items.length} SKU · {number.format(group.totalRecommendedUnits)} ед.</b></header>
         <div className={styles.tableWrap}><table><thead><tr><th>Артикул / наименование</th><th>Заказать</th><th>Срочность</th><th>Покрытие</th><th>Обоснование</th></tr></thead><tbody>
           {group.items.map((item) => {
             const narrativeKey = `${item.supplier}:${item.sku}`;
-            return <tr key={item.sku}><td><b>{item.sku}</b><small>{item.productName}</small></td><td className={styles.qty}>{number.format(item.recommendedOrder)}<small>MOQ {item.moqMultiple ?? "—"}</small></td><td><span className={`${styles.urgency} ${styles[item.urgency]}`}>{urgencyLabel[item.urgency]}</span></td><td>{item.coverageMonths === null ? "—" : `${number.format(item.coverageMonths)} мес.`}</td><td><details><summary>Показать расчёт</summary><p>{explanation(item)}</p>{narratives[narrativeKey] && <div className={styles.aiNarrative}><small>ОБЪЯСНЕНИЕ ИИ</small><p>{narratives[narrativeKey]}</p></div>}<button className={styles.aiButton} disabled={narrating[narrativeKey]} onClick={() => requestNarrative(item)}>{narrating[narrativeKey] ? "ИИ формирует объяснение…" : "Получить объяснение от ИИ"}</button></details></td></tr>;
+            const decision = decisions[narrativeKey] ?? { quantity: item.recommendedOrder, status: "draft" as const };
+            return <tr key={item.sku}><td><b>{item.sku}</b><small>{item.productName}</small><span className={styles.pattern}>{demandPatternLabel[item.demandPattern]}</span></td><td className={styles.qty}>{number.format(item.recommendedOrder)}<small>MOQ {item.moqMultiple ?? "—"}</small>{decision.status === "confirmed" && <small className={styles.confirmed}>Подтверждено: {number.format(decision.quantity)}</small>}</td><td><span className={`${styles.urgency} ${styles[item.urgency]}`}>{urgencyLabel[item.urgency]}</span></td><td>{item.coverageMonths === null ? "—" : `${number.format(item.coverageMonths)} мес.`}</td><td><details><summary>Показать расчёт</summary><p>{explanation(item)}</p>{item.etaAssumptionApplied && <p className={styles.assumption}>Допущение: поставка без ETA включена в горизонт. Менеджеру следует подтвердить дату.</p>}{narratives[narrativeKey] && <div className={styles.aiNarrative}><small>ОБЪЯСНЕНИЕ ИИ</small><p>{narratives[narrativeKey]}</p></div>}<div className={styles.decisionPanel}><label><small>КОЛИЧЕСТВО МЕНЕДЖЕРА</small><input type="number" min="0" step={item.moqMultiple ?? 1} value={decision.quantity} onChange={(event) => setDecisions((current) => ({ ...current, [narrativeKey]: { quantity: Math.max(0, Number(event.target.value) || 0), status: "draft" } }))} /></label><button onClick={() => setDecisions((current) => ({ ...current, [narrativeKey]: { quantity: validManagerQuantity(decision.quantity, item.moqMultiple), status: "confirmed" } }))}>Подтвердить</button></div><button className={styles.aiButton} disabled={narrating[narrativeKey]} onClick={() => requestNarrative(item)}>{narrating[narrativeKey] ? "ИИ формирует объяснение…" : "Получить объяснение от ИИ"}</button></details></td></tr>;
           })}
         </tbody></table></div>
       </article>)}
