@@ -3,6 +3,7 @@
 import { useMemo, useState } from "react";
 import { assembleReplenishmentInput, DEFAULT_ASSEMBLY_ASSUMPTIONS, type SupplierParsedData } from "@/lib/nexus/replenishment/assemble";
 import { calculateReplenishment, type ReplenishmentPlan, type ReplenishmentRecommendation } from "@/lib/nexus/replenishment/calculation";
+import type { ReplenishmentNarrationInput } from "@/lib/nexus/replenishment/narration";
 import { parseInboundShipments, parseMinimumOrderQuantities, parseMonthlyOpeningStock, parseMonthlySales, parseSalesTransactions, parseSkuCategories, parseSkuReservations } from "@/lib/nexus/replenishment/xlsxParsers";
 import styles from "./replenishment.module.css";
 
@@ -48,12 +49,31 @@ function explanation(item: ReplenishmentRecommendation): string {
   return `Базовый спрос ${number.format(item.baseMonthlyDemand)} ед./мес.; сезонность ×${number.format(item.seasonalIndex)}; исторический рост ${percent.format(item.historicalGrowthRate)}; внешний прогноз ${percent.format(item.forecastGrowthRate)}. Поправка stockout: +${number.format(item.stockoutAdjustmentUnitsPerMonth)} ед./мес. (${item.stockoutMonths.length} мес.); исключено всплесков: ${item.excludedSpikeCount} на ${number.format(item.excludedSpikeUnits)} ед. Страховой запас ${number.format(item.safetyStock)} = z ${number.format(item.safetyStockZScore)} × σ ${number.format(item.demandStdDev)} × √горизонта, уровень сервиса ${percent.format(item.serviceLevel)}. Позиция: остаток ${number.format(item.currentStock)} − резерв ${number.format(item.reservedStock)} + в пути ${number.format(item.goodsInTransitWithinHorizon)}; доступный остаток ${number.format(item.availableStock)}, целевой уровень ${number.format(item.targetPosition)}.`;
 }
 
+function narrationInput(item: ReplenishmentRecommendation): ReplenishmentNarrationInput {
+  const {
+    sku, productName, supplier, category, baseMonthlyDemand, seasonalIndex, historicalGrowthRate,
+    forecastGrowthRate, stockoutAdjustmentUnitsPerMonth, stockoutMonths, excludedSpikeCount,
+    excludedSpikeUnits, currentStock, reservedStock, availableStock, goodsInTransitWithinHorizon,
+    demandStdDev, serviceLevel, safetyStockZScore, safetyStock, targetPosition, currentPosition,
+    recommendedOrder, urgency,
+  } = item;
+  return {
+    sku, productName, supplier, category, baseMonthlyDemand, seasonalIndex, historicalGrowthRate,
+    forecastGrowthRate, stockoutAdjustmentUnitsPerMonth, stockoutMonths, excludedSpikeCount,
+    excludedSpikeUnits, currentStock, reservedStock, availableStock, goodsInTransitWithinHorizon,
+    demandStdDev, serviceLevel, safetyStockZScore, safetyStock, targetPosition, currentPosition,
+    recommendedOrder, urgency,
+  };
+}
+
 export function ReplenishmentWorkspace() {
   const [files, setFiles] = useState<FilesState>({ iek: {}, systeme: {} });
   const [plan, setPlan] = useState<ReplenishmentPlan>();
   const [error, setError] = useState("");
   const [running, setRunning] = useState(false);
   const [query, setQuery] = useState("");
+  const [narratives, setNarratives] = useState<Record<string, string>>({});
+  const [narrating, setNarrating] = useState<Record<string, boolean>>({});
   const selectedCount = Object.values(files).flatMap((group) => Object.values(group)).length;
   const ready = selectedCount === FILE_FIELDS.length * SUPPLIERS.length;
 
@@ -72,6 +92,27 @@ export function ReplenishmentWorkspace() {
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Не удалось обработать XLSX-файлы.");
     } finally { setRunning(false); }
+  };
+
+  const requestNarrative = async (item: ReplenishmentRecommendation) => {
+    const key = `${item.supplier}:${item.sku}`;
+    setNarrating((current) => ({ ...current, [key]: true }));
+    try {
+      const response = await fetch("/api/replenishment/narrate", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(narrationInput(item)),
+      });
+      const result = await response.json() as { narrative?: unknown; source?: unknown };
+      const narrative = typeof result.narrative === "string" ? result.narrative.trim() : "";
+      if (response.ok && result.source === "LLM" && narrative) {
+        setNarratives((current) => ({ ...current, [key]: narrative }));
+      }
+    } catch {
+      // The deterministic explanation remains visible; LLM narration is optional enhancement only.
+    } finally {
+      setNarrating((current) => ({ ...current, [key]: false }));
+    }
   };
 
   return <main className={styles.shell}>
@@ -117,7 +158,10 @@ export function ReplenishmentWorkspace() {
       {visible.map((group) => <article className={styles.resultGroup} key={group.supplier}>
         <header><div><span>ПОСТАВЩИК</span><h3>{group.supplier}</h3></div><b>{group.items.length} SKU · {number.format(group.totalRecommendedUnits)} ед.</b></header>
         <div className={styles.tableWrap}><table><thead><tr><th>Артикул / наименование</th><th>Заказать</th><th>Срочность</th><th>Покрытие</th><th>Обоснование</th></tr></thead><tbody>
-          {group.items.map((item) => <tr key={item.sku}><td><b>{item.sku}</b><small>{item.productName}</small></td><td className={styles.qty}>{number.format(item.recommendedOrder)}<small>MOQ {item.moqMultiple ?? "—"}</small></td><td><span className={`${styles.urgency} ${styles[item.urgency]}`}>{urgencyLabel[item.urgency]}</span></td><td>{item.coverageMonths === null ? "—" : `${number.format(item.coverageMonths)} мес.`}</td><td><details><summary>Показать расчёт</summary><p>{explanation(item)}</p></details></td></tr>)}
+          {group.items.map((item) => {
+            const narrativeKey = `${item.supplier}:${item.sku}`;
+            return <tr key={item.sku}><td><b>{item.sku}</b><small>{item.productName}</small></td><td className={styles.qty}>{number.format(item.recommendedOrder)}<small>MOQ {item.moqMultiple ?? "—"}</small></td><td><span className={`${styles.urgency} ${styles[item.urgency]}`}>{urgencyLabel[item.urgency]}</span></td><td>{item.coverageMonths === null ? "—" : `${number.format(item.coverageMonths)} мес.`}</td><td><details><summary>Показать расчёт</summary><p>{explanation(item)}</p>{narratives[narrativeKey] && <div className={styles.aiNarrative}><small>ОБЪЯСНЕНИЕ ИИ</small><p>{narratives[narrativeKey]}</p></div>}<button className={styles.aiButton} disabled={narrating[narrativeKey]} onClick={() => requestNarrative(item)}>{narrating[narrativeKey] ? "ИИ формирует объяснение…" : "Получить объяснение от ИИ"}</button></details></td></tr>;
+          })}
         </tbody></table></div>
       </article>)}
     </section>}
