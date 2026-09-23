@@ -10,3 +10,4 @@ out/
 # demo/data/replenishment/ (byte-identical, committed); ignoring these avoids duplicating ~15 MB.
 /IEK/
 /Systeme electric/
+.vercel
