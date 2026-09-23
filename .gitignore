@@ -5,7 +5,3 @@ out/
 !.env.example
 *.tsbuildinfo
 .claude/
-
-# Real partner business data (sales/stock/pricing) — never committed, local-only per data-privacy constraint
-IEK/
-Systeme electric/
